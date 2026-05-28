@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# bin/check_status — report the current state of replicated/ and tell
+# you what to run next.
+#
+# Useful right after opening a codespace (or reconnecting to a tmux
+# session) when you don't remember whether a previous pipeline run
+# finished, was interrupted by an idle timeout, or never started.
+#
+# Reads only.  Never modifies anything.
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+EXPECT_DATA_CSVS=24     # 8 race/raw + 1 race/raw/cohort_bands + 8 race/augmented + 1 moments + 6 percentile
+EXPECT_SIM_IMPS=50      # imp_01.rds .. imp_50.rds (meta.rds is separate)
+EXPECT_DOCS=3           # sat_model.docx, sat_model.html, sat_model.pdf
+
+n_data=$(find replicated/data -name '*.csv' 2>/dev/null | wc -l | tr -d ' ')
+n_imp=$(find replicated/sims/mi -maxdepth 1 -name 'imp_*.rds' 2>/dev/null | wc -l | tr -d ' ')
+meta_present=$( [[ -f replicated/sims/mi/meta.rds ]] && echo yes || echo no )
+n_docs=$(ls replicated/docs/sat_model.docx replicated/docs/sat_model.html \
+              replicated/docs/sat_model.pdf 2>/dev/null | wc -l | tr -d ' ')
+
+printf '\n  data:   %2d / %2d  CSVs\n'                "$n_data" "$EXPECT_DATA_CSVS"
+printf '  sims:   %2d / %2d  imp_*.rds   meta.rds: %s\n' "$n_imp"  "$EXPECT_SIM_IMPS" "$meta_present"
+printf '  docs:   %2d / %2d  sat_model.{docx,html,pdf}\n\n' "$n_docs" "$EXPECT_DOCS"
+
+# Classify each scope: complete / partial / empty.
+data_state="empty"
+[[ $n_data -gt 0 && $n_data -lt $EXPECT_DATA_CSVS ]] && data_state="partial"
+[[ $n_data -ge $EXPECT_DATA_CSVS               ]] && data_state="complete"
+
+sims_state="empty"
+[[ $n_imp -gt 0 ]] && sims_state="partial"
+[[ $n_imp -ge $EXPECT_SIM_IMPS && "$meta_present" == "yes" ]] && sims_state="complete"
+
+docs_state="empty"
+[[ $n_docs -gt 0 && $n_docs -lt $EXPECT_DOCS ]] && docs_state="partial"
+[[ $n_docs -ge $EXPECT_DOCS                   ]] && docs_state="complete"
+
+# Recommend the next command. Walk the pipeline in order and stop at
+# the first stage that needs work.
+echo "next:"
+if [[ "$data_state" == "empty" ]]; then
+    cat <<EOF
+  replicated/data/ is empty.  Recover with one of:
+    bin/restore  data    # copy the canonical CSVs back (instant)
+    bin/generate data    # OR re-derive from downloads/ (~2 min)
+EOF
+elif [[ "$data_state" == "partial" ]]; then
+    cat <<EOF
+  replicated/data/ has $n_data of $EXPECT_DATA_CSVS CSVs — partial state.
+  Recover with one of:
+    bin/restore  data    # copy the canonical CSVs back (instant)
+    bin/clean data && bin/generate data
+                          # OR clear and re-derive (~2 min)
+EOF
+elif [[ "$sims_state" == "partial" ]]; then
+    cat <<EOF
+  replicated/sims/ has $n_imp of $EXPECT_SIM_IMPS imputations (a previous run
+  was interrupted).  Resume — already-done imputations are skipped:
+    bin/generate sims    # finishes the remaining $((EXPECT_SIM_IMPS - n_imp)) imputations
+  (Do NOT run bin/everything sims or bin/clean sims — those wipe progress.)
+EOF
+elif [[ "$sims_state" == "empty" ]]; then
+    cat <<EOF
+  replicated/sims/ is empty.  Recover with one of:
+    bin/restore  sims    # copy the canonical draws back (instant)
+    bin/generate sims    # OR refit from scratch (~50 min on 8 cores)
+EOF
+elif [[ "$docs_state" == "empty" || "$docs_state" == "partial" ]]; then
+    cat <<EOF
+  replicated/docs/ is $docs_state.  Render with:
+    bin/generate docs    # ~5 min
+EOF
+else
+    cat <<EOF
+  Everything is present.  To verify against submitted/:
+    bin/compare all
+EOF
+fi
+echo

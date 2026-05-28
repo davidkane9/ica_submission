@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# bin/generate <scope> — run the pipeline step that produces
+# replicated/<scope>/ from earlier-stage inputs.
+#
+# Scope is one of:
+#   data    parse the source PDFs under downloads/   → replicated/data/   (~2 min)
+#   sims    refit the Stan model from replicated/data/ → replicated/sims/  (~50 min on 8 cores)
+#   docs    render documents/sat_model.qmd            → replicated/docs/  (~5 min)
+#   all     data → sims → docs in that order         (~1 hour, dominated by sims)
+#
+# Each stage reads from the prior stage's replicated/ output (or from
+# downloads/, for the parse step). If a needed input is missing,
+# generate exits with a clear error and points at bin/restore (instant
+# restore from submitted/) or the missing-stage generate command.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+scope="${1:-}"
+case "$scope" in
+    data|sims|docs|all) ;;
+    *) echo "usage: $0 {data|sims|docs|all}" >&2; exit 2 ;;
+esac
+
+# Fail loudly with two recovery paths when a needed input is absent.
+require_input() {
+    local kind="$1" path="$2"
+    if [[ ! -d "$path" || -z "$(find "$path" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+        cat >&2 <<EOF
+
+ERROR: $path is empty — bin/generate $scope needs $kind inputs.
+Recover with one of:
+  bin/restore $kind       # copy the as-submitted $kind back in (instant)
+  bin/generate $kind      # re-derive $kind from earlier stages
+
+EOF
+        exit 2
+    fi
+}
+
+# Pick the Python runner.  The three extractors declare their
+# dependencies inline via PEP-723 metadata; `uv run` resolves them
+# in an ephemeral env (the local-laptop path).  In the codespace
+# `post-create.sh` pre-installs the pins into the system python3,
+# so falling back to `python3` works there even without uv.
+if command -v uv >/dev/null 2>&1; then
+    PY_RUN=(uv run --quiet)
+else
+    PY_RUN=(python3)
+fi
+
+gen_data() {
+    echo "=== generate data ==="
+    "${PY_RUN[@]}" code/extract_sat.py
+    "${PY_RUN[@]}" code/augment_race.py
+    "${PY_RUN[@]}" code/extract_user_percentiles.py
+}
+
+gen_sims() {
+    echo "=== generate sims ==="
+    require_input data replicated/data/race/augmented
+    (cd code && Rscript run_fit_mi.R)
+}
+
+gen_docs() {
+    echo "=== generate docs ==="
+    require_input data replicated/data/race/augmented
+    require_input sims replicated/sims/mi
+    # Render every .qmd present in documents/. sat_model.qmd is the
+    # tracked replication target and always present; the four
+    # ancillary qmds (abstract, cover_letter, lede, title_page) are
+    # gitignored author-only files, so they may or may not be present.
+    # We render whatever's there.
+    (
+        cd documents
+        for qmd in *.qmd; do
+            [[ -f "$qmd" ]] || continue
+            echo "  rendering $qmd"
+            quarto render "$qmd" --output-dir ../replicated/docs
+        done
+    )
+}
+
+case "$scope" in
+    data) gen_data ;;
+    sims) gen_sims ;;
+    docs) gen_docs ;;
+    all)  gen_data; gen_sims; gen_docs ;;
+esac

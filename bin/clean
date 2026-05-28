@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# bin/clean <scope> — remove everything under replicated/<scope>/.
+#
+# Scope is one of:
+#   data    just replicated/data/
+#   sims    just replicated/sims/
+#   docs    just replicated/docs/
+#   all     all three
+#
+# Never touches submitted/.  Re-creates the now-empty target
+# directories so the rest of the pipeline can write into them.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+scope="${1:-}"
+case "$scope" in
+    data) targets=(replicated/data) ;;
+    sims) targets=(replicated/sims) ;;
+    docs) targets=(replicated/docs) ;;
+    all)  targets=(replicated/data replicated/sims replicated/docs) ;;
+    *)    echo "usage: $0 {data|sims|docs|all}" >&2; exit 2 ;;
+esac
+
+for t in "${targets[@]}"; do
+    rm -rf -- "$t"
+    mkdir -p "$t"
+    echo "  cleaned $t/"
+done

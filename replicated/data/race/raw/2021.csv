@@ -1,0 +1,10 @@
+race,N,mean,b_400_590,b_600_790,b_800_990,b_1000_1190,b_1200_1390,b_1400_1600
+American Indian/Alaska Native,10288,927,1,25,43,24,7,1
+Asian,167208,1239,0,2,12,26,33,27
+Black/African American,168454,934,1,23,43,24,8,1
+Hispanic/Latino,352094,967,0,18,40,28,10,2
+Native Hawaiian/Other Pacific Islander,3015,950,0,21,42,25,8,3
+White,635486,1112,0,5,23,39,26,8
+Two or More Races,54961,1116,0,6,24,35,24,11
+No Response,117627,976,,,,,,
+Total,1509133,1060,,,,,,

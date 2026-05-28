@@ -1,0 +1,42 @@
+# macOS / editor junk
+.DS_Store
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# Quarto / R intermediates
+.quarto/
+*_files/
+
+# Compiled Stan binaries — CPU-architecture-specific, rebuilt by cmdstan
+# from the .stan source on first sample. Pattern matches the stem name
+# that cmdstan produces alongside each .stan file.
+code/shash_dirichlet_bands
+code/shash_dirichlet_bands.hpp
+code/shash_dirichlet_bands.d
+
+# Ephemeral comparison artifact produced by `bin/compare docs`;
+# regenerated whenever the script runs.
+replicated/docs/compare.html
+
+# Ancillary ICA-submission documents (abstract, cover letter, lede,
+# title page).  These live LOCALLY in documents/ so the author can
+# render them for the actual submission packet, and their rendered
+# outputs are kept locally in submitted/docs/ and replicated/docs/.
+# None of them are part of the replication target — only sat_model.qmd
+# is — so they are not committed to git. Patterns match the file in
+# any directory.
+abstract.qmd
+abstract.docx
+abstract.html
+cover_letter.qmd
+cover_letter.docx
+cover_letter.html
+lede.qmd
+lede.docx
+lede.html
+title_page.qmd
+title_page.docx
+title_page.html

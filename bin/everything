@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# bin/everything <scope> — clean, generate, then compare in one shot.
+# Equivalent to running, in order:
+#     bin/clean    <scope>
+#     bin/generate <scope>
+#     bin/compare  <scope>
+#
+# Scope is one of:
+#   data    test that the Python parsers produce the canonical CSVs    (~2 min)
+#   sims    test that the Stan refit reproduces the canonical draws    (~50 min on 8 cores)
+#   docs    test that quarto render reproduces the canonical .docx/.pdf/.html
+#   all     test the entire chain end-to-end                           (~1 hour on 8 cores)
+#
+# Exits with the exit code of the final compare step: 0 if every file
+# in the cleaned/regenerated tree byte-matches submitted/, non-zero
+# otherwise.  Hard exits earlier if clean or generate fail.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+scope="${1:-}"
+case "$scope" in
+    data|sims|docs|all) ;;
+    *) echo "usage: $0 {data|sims|docs|all}" >&2; exit 2 ;;
+esac
+
+bin/clean    "$scope"
+echo
+bin/generate "$scope"
+echo
+bin/compare  "$scope"

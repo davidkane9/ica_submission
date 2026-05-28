@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# bin/restore <scope> — overwrite replicated/<scope>/ with a fresh
+# copy of submitted/<scope>/, snapping replicated/ back to the
+# canonical reference state. The inverse of running the pipeline
+# yourself: instead of regenerating, restore the canonical artifact.
+#
+# Scope is one of:
+#   data    submitted/data/  → replicated/data/
+#   sims    submitted/sims/  → replicated/sims/
+#   docs    submitted/docs/  → replicated/docs/
+#   all     all three
+#
+# Used by anyone who has hosed their replicated/ tree (a botched
+# experiment, an interrupted generate, a stray rm -rf) and wants a
+# clean baseline without re-running the pipeline.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+scope="${1:-}"
+case "$scope" in
+    data|sims|docs|all) ;;
+    *) echo "usage: $0 {data|sims|docs|all}" >&2; exit 2 ;;
+esac
+
+restore_one() {
+    local kind="$1"
+    local src="submitted/$kind" dst="replicated/$kind"
+    if [[ ! -d "$src" ]]; then
+        echo "  (no submitted/$kind/ to restore from)"
+        return
+    fi
+    rm -rf -- "$dst"
+    mkdir -p "$dst"
+    # cp -a preserves modes and timestamps so a subsequent bin/compare
+    # reports byte-identity cleanly.
+    cp -a "$src/." "$dst/"
+    local n
+    n=$(find "$dst" -type f | wc -l | tr -d ' ')
+    echo "  restored submitted/$kind/  →  replicated/$kind/  ($n files)"
+}
+
+case "$scope" in
+    data) restore_one data ;;
+    sims) restore_one sims ;;
+    docs) restore_one docs ;;
+    all)  restore_one data; restore_one sims; restore_one docs ;;
+esac

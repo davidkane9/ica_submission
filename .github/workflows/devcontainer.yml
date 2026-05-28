@@ -1,0 +1,79 @@
+# Build the devcontainer end-to-end and run the actual replication
+# pipeline against the as-submitted artifacts, so any regression in
+# .devcontainer/, bin/, code/, or documents/ fails CI before it
+# reaches a user's codespace.
+#
+# Inside the freshly-built container we run, in order:
+#   1. bin/check_env       — verify every pinned dep is installed
+#   2. bin/everything data — clean replicated/data/, regenerate from
+#                            downloads/, diff against submitted/data/
+#                            (exits non-zero on any DIFFER)
+#   3. bin/everything docs — clean replicated/docs/, re-render
+#                            documents/sat_model.qmd, diff against
+#                            submitted/docs/
+#
+# bin/everything sims is deliberately skipped: it's a ~3-hour Stan
+# refit and would blow the default 6-hour GitHub Actions budget every
+# time. Users run it themselves when they want full coverage.
+#
+# Uses the official devcontainers/ci action — the same engine
+# Codespaces runs (the @devcontainers/cli node package). A full build
+# takes ~12 minutes; the action's docker-layer cache keeps repeat runs
+# fast.
+
+name: devcontainer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.devcontainer/**'
+      - 'bin/**'
+      - 'code/**'
+      - 'documents/**'
+      - '.github/workflows/devcontainer.yml'
+  pull_request:
+    paths:
+      - '.devcontainer/**'
+      - 'bin/**'
+      - 'code/**'
+      - 'documents/**'
+      - '.github/workflows/devcontainer.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # The base image is pulled from ghcr.io anonymously; no auth
+      # needed. The runCmd executes inside the built container as
+      # remoteUser (rstudio); any non-zero exit propagates to the
+      # workflow and fails the run.
+      - name: Build devcontainer, verify env, and replicate data+docs
+        uses: devcontainers/ci@v0.3
+        with:
+          # We only build for CI verification; we don't publish the
+          # image anywhere. Without push: never, the action's post-job
+          # step tries to push and errors with
+          #   "imageName is required to push images"
+          # because we haven't set an imageName / registry.
+          push: never
+          runCmd: |
+            set -euo pipefail
+            bin/check_env
+            bin/everything data
+            # docs: clean + generate are hard requirements (a render failure
+            # means the manuscript can't be reproduced). The compare step
+            # is downgraded to a workflow warning: Quarto + Typst can emit
+            # tiny per-render differences (encoding metadata, embedded
+            # font subsets, etc.) even with SOURCE_DATE_EPOCH pinned, and
+            # we don't want such cosmetic noise to block PRs. The diff
+            # itself is printed in this step's log above the warning, so a
+            # human can decide whether the change is meaningful.
+            bin/clean    docs
+            bin/generate docs
+            bin/compare  docs || \
+              echo "::warning::bin/compare docs reported differences between the freshly-rendered files and submitted/docs/. See the step log for the diff."

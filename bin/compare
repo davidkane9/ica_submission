@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# bin/compare <scope> — diff replicated/<scope>/ against submitted/<scope>/.
+#
+# Behavior depends on the scope:
+#
+#   data    Walk every file under data/ in both trees.  Equality is
+#           byte-for-byte via cmp; when a CSV DIFFERs, a unified diff
+#           is printed inline (capped at MAX_DIFF_LINES).
+#
+#   sims    Walk every file under sims/ in both trees.  Equality is
+#           byte-for-byte via cmp.  No content diff is printed —
+#           R's binary serialization (.rds) isn't usefully diffable;
+#           inspect with readRDS() if you want to know what moved.
+#
+#   docs    Build a self-contained side-by-side visual comparison at
+#           replicated/docs/compare.html.  No per-file cmp reporting:
+#           Quarto / Typst can emit tiny per-render differences that
+#           don't matter for the published artifact, so the byte-level
+#           question is uninteresting here — what matters is whether
+#           the abstract, tables, and figures look right.  Open the
+#           generated compare.html in any browser to scroll through.
+#
+#   all     data, then sims, then docs.
+#
+# Per-file statuses (data, sims):
+#   OK       byte-identical
+#   DIFFER   contents differ
+#   NOSUBM   present in replicated/ but missing from submitted/
+#   NOWORK   present in submitted/ but missing from replicated/
+#
+# Exit code: 0 if every data + sims file is OK; non-zero otherwise.
+# The docs scope never affects the exit code (compare.html generation
+# either succeeds, in which case there's nothing to fail on, or hard-
+# errors with a Python traceback).
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+scope="${1:-}"
+case "$scope" in
+    data|sims|docs|all) ;;
+    *) echo "usage: $0 {data|sims|docs|all}" >&2; exit 2 ;;
+esac
+
+MAX_DIFF_LINES=100
+
+ok=0; differ=0; nosubm=0; nowork=0
+
+print_status() { printf '  %-7s %s\n' "$1" "$2"; }
+
+indented_diff() {
+    local a="$1" b="$2" label_a="$3" label_b="$4"
+    local n
+    n=$(diff -u --label "$label_a" --label "$label_b" "$a" "$b" 2>/dev/null | wc -l)
+    diff -u --label "$label_a" --label "$label_b" "$a" "$b" 2>/dev/null \
+        | sed 's/^/        /' | head -n "$MAX_DIFF_LINES"
+    (( n > MAX_DIFF_LINES )) && printf '        ... (%d more diff lines)\n' "$((n - MAX_DIFF_LINES))"
+}
+
+compare_file() {
+    local rel="$1" want_diff="$2"
+    local r="replicated/$rel" s="submitted/$rel"
+    if [[ ! -e "$r" && ! -e "$s" ]]; then return; fi
+    if [[ ! -e "$s" ]]; then print_status NOSUBM "$rel"; nosubm=$((nosubm+1)); return; fi
+    if [[ ! -e "$r" ]]; then print_status NOWORK "$rel"; nowork=$((nowork+1)); return; fi
+    if cmp -s "$r" "$s"; then
+        print_status OK "$rel"
+        ok=$((ok+1))
+    else
+        print_status DIFFER "$rel"
+        differ=$((differ+1))
+        if [[ "$want_diff" == yes ]]; then
+            indented_diff "$s" "$r" "$s" "$r"
+        fi
+    fi
+}
+
+# Walk the union of files in replicated/<scope_dir>/ and submitted/<scope_dir>/.
+# Paths reported relative to the repo root (the "replicated/" /
+# "submitted/" prefix is stripped, so each file shows up once).
+walk_scope() {
+    local scope_dir="$1" want_diff="$2"
+    local paths
+    paths=$( { find "replicated/$scope_dir" -type f 2>/dev/null
+               find "submitted/$scope_dir"  -type f 2>/dev/null
+             } | sed -E "s#^(replicated|submitted)/##" | sort -u )
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        compare_file "$rel" "$want_diff"
+    done <<<"$paths"
+}
+
+# Generate replicated/docs/compare.html — a self-contained side-by-
+# side rendering of the abstract plus every labeled table and figure
+# from submitted/docs/sat_model.html and replicated/docs/sat_model.html.
+# Quarto emits embed-resources HTML (base64-inlined images), so the
+# generated page is fully portable.  Requires beautifulsoup4.
+generate_compare_html() {
+    python3 - <<'PY'
+import sys
+from pathlib import Path
+
+try:
+    from bs4 import BeautifulSoup, Tag
+except ImportError:
+    print("beautifulsoup4 is not installed. Run:\n"
+          "    python3 -m pip install --user beautifulsoup4",
+          file=sys.stderr)
+    sys.exit(2)
+
+ROOT       = Path.cwd()
+SUBMITTED  = ROOT / "submitted"  / "docs" / "sat_model.html"
+REPLICATED = ROOT / "replicated" / "docs" / "sat_model.html"
+OUTPUT     = ROOT / "replicated" / "docs" / "compare.html"
+
+if not SUBMITTED.exists():
+    print(f"missing: {SUBMITTED}", file=sys.stderr); sys.exit(2)
+if not REPLICATED.exists():
+    print(f"missing: {REPLICATED}", file=sys.stderr); sys.exit(2)
+
+
+def find_elements(soup):
+    """Return [(label, kind, html-fragment), ...] in document order.
+    kind is one of "abstract", "tbl", "fig"."""
+    out = []
+
+    # Abstract: two qmd shapes to support.
+    #   (a) Modern: the qmd has `# Abstract {.unnumbered}`, so Quarto emits
+    #       <section id="abstract">...</section> as the first <section>.
+    #       Pull that section's body, dropping its leading <h1>Abstract</h1>
+    #       (the compare layout adds its own "Abstract" label, so keeping
+    #       the heading inside the content would be duplicative).
+    #   (b) Legacy: the qmd has the abstract as a bare body paragraph,
+    #       a sibling of <header id="title-block-header">.  Walk the
+    #       header's next_siblings until the first <section>.
+    abstract_section = soup.find("section", id="abstract")
+    if abstract_section is not None:
+        body_parts = []
+        for child in abstract_section.children:
+            if isinstance(child, Tag) and child.name in ("h1", "h2", "h3", "h4"):
+                continue
+            body_parts.append(str(child))
+        out.append(("Abstract", "abstract", "".join(body_parts).strip()))
+    else:
+        header = soup.find("header", id="title-block-header")
+        if header is not None:
+            abstract_html = []
+            for sib in header.next_siblings:
+                if isinstance(sib, Tag) and sib.name == "section":
+                    break
+                if not isinstance(sib, Tag):
+                    continue
+                # Skip the inline R setup chunk's empty cell wrapper
+                # (#| include: false emits an empty <div class="cell">).
+                if "cell" in (sib.get("class") or []) and not sib.get_text(strip=True):
+                    continue
+                abstract_html.append(str(sib))
+            if abstract_html:
+                out.append(("Abstract", "abstract",
+                            "".join(abstract_html).strip()))
+
+    # Labeled tables and figures in document order.  Outer wrappers only
+    # (id="tbl-foo" / "fig-foo"); skip Quarto's internal caption divs
+    # (id="tbl-foo-caption-<uuid>").
+    for el in soup.find_all("div", id=True):
+        el_id = el.get("id", "")
+        if "-caption-" in el_id:
+            continue
+        if el_id.startswith("tbl-"):
+            out.append((f"Table {el_id}", "tbl", str(el)))
+        elif el_id.startswith("fig-"):
+            out.append((f"Figure {el_id}", "fig", str(el)))
+
+    return out
+
+
+def extract_styles(soup):
+    if soup.head is None:
+        return ""
+    return "\n".join(str(s) for s in soup.head.find_all("style"))
+
+
+sub_soup = BeautifulSoup(SUBMITTED.read_text(),  "html.parser")
+rep_soup = BeautifulSoup(REPLICATED.read_text(), "html.parser")
+
+sub_elems = find_elements(sub_soup)
+rep_elems = find_elements(rep_soup)
+css       = extract_styles(sub_soup)
+
+sub_map = {label: html for (label, _kind, html) in sub_elems}
+rep_map = {label: html for (label, _kind, html) in rep_elems}
+
+seen, ordered = set(), []
+for label, _, _ in sub_elems + rep_elems:
+    if label not in seen:
+        ordered.append(label); seen.add(label)
+
+
+def section(label):
+    sub_html = sub_map.get(label,
+        '<p class="cmp-missing"><em>(not present in submitted)</em></p>')
+    rep_html = rep_map.get(label,
+        '<p class="cmp-missing"><em>(not present in replicated)</em></p>')
+    return f"""<section class="cmp-section">
+  <h2 class="cmp-label">{label}</h2>
+  <div class="cmp-block cmp-submitted">
+    <div class="cmp-source-tag">submitted</div>
+    {sub_html}
+  </div>
+  <div class="cmp-block cmp-replicated">
+    <div class="cmp-source-tag">replicated</div>
+    {rep_html}
+  </div>
+</section>"""
+
+
+body = "\n".join(section(lbl) for lbl in ordered)
+
+OUTPUT.write_text(f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>compare: submitted vs replicated</title>
+<!-- Inline the source manuscript's CSS so embedded fragments render
+     the way they did in sat_model.html. -->
+{css}
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    margin: 24px auto;
+    max-width: 1100px;
+    color: #222;
+    line-height: 1.45;
+  }}
+  .cmp-intro {{ color: #555; }}
+  .cmp-section {{ margin-top: 36px; padding-top: 12px; border-top: 1px solid #ddd; }}
+  .cmp-label {{
+    background: #f3f3f3; padding: 8px 12px; margin: 0 0 12px 0;
+    border-left: 4px solid #555; font-size: 1.05em;
+  }}
+  .cmp-block {{ border: 1px solid #ddd; border-radius: 4px; padding: 16px; margin-bottom: 12px; }}
+  .cmp-submitted  {{ background: #f5faff; border-left: 4px solid #2c7fb8; }}
+  .cmp-replicated {{ background: #fdf5fa; border-left: 4px solid #b8472c; }}
+  .cmp-source-tag {{
+    display: inline-block; font-size: 0.8em; font-weight: bold;
+    color: #555; padding: 2px 8px; margin-bottom: 8px;
+    background: #fff; border: 1px solid #ddd; border-radius: 12px;
+  }}
+  .cmp-missing {{ color: #999; }}
+  img {{ max-width: 100%; height: auto; }}
+</style>
+</head>
+<body>
+<h1>Visual comparison: submitted vs replicated</h1>
+<p class="cmp-intro">For each element in <code>sat_model.html</code>
+(abstract, then every labeled table and figure in document order),
+the version from <code>submitted/docs/</code> is shown first and the
+version from <code>replicated/docs/</code> directly below it.
+Generated by <code>bin/compare docs</code>.</p>
+{body}
+</body>
+</html>
+""")
+
+print(f"wrote {OUTPUT.relative_to(ROOT)}")
+print(f"  {len(sub_elems)} elements from submitted/, {len(rep_elems)} from replicated/")
+print(f"\nOpen replicated/docs/compare.html in a browser to view.")
+PY
+}
+
+if [[ "$scope" == data || "$scope" == all ]]; then
+    echo "=== data ==="
+    walk_scope data yes
+fi
+if [[ "$scope" == sims || "$scope" == all ]]; then
+    echo "=== sims ==="
+    walk_scope sims no
+fi
+if [[ "$scope" == docs || "$scope" == all ]]; then
+    echo "=== docs ==="
+    generate_compare_html
+fi
+
+# Summary applies only to the cmp-based scopes (data, sims).  When the
+# user runs `bin/compare docs` alone, no per-file walk happened, so
+# emitting "0 OK, 0 DIFFER, ..." would be misleading.
+if [[ "$scope" == data || "$scope" == sims || "$scope" == all ]]; then
+    echo
+    printf 'summary: %d OK, %d DIFFER, %d NOSUBM (replicated-only), %d NOWORK (submitted-only)\n' \
+        "$ok" "$differ" "$nosubm" "$nowork"
+    if (( differ + nosubm + nowork > 0 )); then exit 1; fi
+fi
+exit 0

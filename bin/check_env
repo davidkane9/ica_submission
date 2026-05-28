@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# Verify the codespace environment is in the state the replication
+# pipeline expects: every binary on PATH, every R and Python package
+# installed and importable at the pinned version (where pinned), and
+# the cmdstan toolchain registered with cmdstanr.
+#
+# Run by .devcontainer/post-create.sh at the very end of the build so
+# any silent failure of an earlier install step surfaces immediately;
+# also runnable on demand from a codespace terminal:
+#
+#     bin/check_env
+#
+# Exit code:
+#     0  every check passed
+#     1  one or more checks failed (each prints a FAIL line)
+
+set -u
+cd "$(dirname "$0")/.."
+
+failures=0
+pass() { printf '  OK    %s\n' "$1"; }
+fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
+
+
+# ─── binaries on PATH ──────────────────────────────────────────────────
+echo "=== binaries on PATH ==="
+for bin in R Rscript python3 quarto pandoc rsync pdftotext; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        pass "$bin → $(command -v "$bin")"
+    else
+        fail "$bin not on PATH"
+    fi
+done
+
+# ─── R and the R packages we use ───────────────────────────────────────
+echo
+echo "=== R packages ==="
+# One Rscript call checks every package — much faster than N invocations.
+# Each line on stdout is either "OK <pkg> <version>" or "FAIL <pkg> <reason>".
+# We trust the env-var pins for cmdstanr; tidyverse + co. are pinned via the
+# PPM snapshot date and we just check loadability.
+r_report="$(Rscript --vanilla -e '
+expected_cmdstanr <- Sys.getenv("CMDSTANR_VERSION", unset = NA)
+pkgs <- c("tidyverse", "scales", "knitr", "posterior", "remotes", "cmdstanr")
+status <- 0L
+for (p in pkgs) {
+    ok <- requireNamespace(p, quietly = TRUE)
+    if (!ok) {
+        cat(sprintf("FAIL %s not installed\n", p)); status <- 1L; next
+    }
+    v <- as.character(packageVersion(p))
+    if (p == "cmdstanr" && !is.na(expected_cmdstanr) && v != expected_cmdstanr) {
+        cat(sprintf("FAIL %s version %s (expected %s)\n", p, v, expected_cmdstanr))
+        status <- 1L
+    } else {
+        cat(sprintf("OK %s %s\n", p, v))
+    }
+}
+cat(sprintf("R-version %s\n", R.version.string))
+quit(status = status)
+' 2>&1)"
+r_exit=$?
+while IFS= read -r line; do
+    case "$line" in
+        "OK "*)        pass "R: ${line#OK }" ;;
+        "FAIL "*)      fail "R: ${line#FAIL }" ;;
+        "R-version "*) pass "R: ${line#R-version }" ;;
+        *) printf '       %s\n' "$line" ;;
+    esac
+done <<<"$r_report"
+[[ $r_exit -ne 0 ]] && failures=$((failures + 1))
+
+# ─── cmdstan toolchain ─────────────────────────────────────────────────
+echo
+echo "=== cmdstan ==="
+cmdstan_check="$(Rscript --vanilla -e '
+expected <- Sys.getenv("CMDSTAN_VERSION", unset = NA)
+v <- tryCatch(
+    as.character(cmdstanr::cmdstan_version(error_on_NA = FALSE)),
+    error = function(e) NA_character_)
+if (is.na(v) || !nzchar(v)) {
+    cat("FAIL not registered with cmdstanr (CMDSTAN env =",
+        Sys.getenv("CMDSTAN"), ")\n")
+    quit(status = 1)
+}
+if (!is.na(expected) && v != expected) {
+    cat(sprintf("FAIL cmdstan version %s (expected %s)\n", v, expected))
+    quit(status = 1)
+}
+cat(sprintf("OK cmdstan %s at %s\n", v, cmdstanr::cmdstan_path()))
+' 2>&1)"
+case "$cmdstan_check" in
+    "OK "*)   pass "${cmdstan_check#OK }" ;;
+    "FAIL "*) fail "${cmdstan_check#FAIL }" ;;
+    *)        fail "cmdstan check returned: $cmdstan_check" ;;
+esac
+
+# ─── Python and the Python packages we use ─────────────────────────────
+echo
+echo "=== Python packages ==="
+py_report="$(python3 - <<'PY' 2>&1
+import importlib, os, sys
+
+pins = {
+    "pdfplumber":     os.environ.get("PDFPLUMBER_VERSION"),
+    "beautifulsoup4": os.environ.get("BS4_VERSION"),
+}
+# beautifulsoup4 is imported as `bs4`; pdfplumber matches its pip name.
+import_names = {"pdfplumber": "pdfplumber", "beautifulsoup4": "bs4"}
+
+status = 0
+for pkg, expected in pins.items():
+    modname = import_names[pkg]
+    try:
+        mod = importlib.import_module(modname)
+    except Exception as e:
+        print(f"FAIL {pkg} not importable as {modname}: {e}")
+        status = 1
+        continue
+    # Best-effort version lookup — both deps expose __version__.
+    ver = getattr(mod, "__version__", None) or "?"
+    if expected and ver != expected:
+        print(f"FAIL {pkg} version {ver} (expected {expected})")
+        status = 1
+    else:
+        print(f"OK {pkg} {ver}")
+
+print(f"PY-version {sys.version.split()[0]} at {sys.executable}")
+sys.exit(status)
+PY
+)"
+py_exit=$?
+while IFS= read -r line; do
+    case "$line" in
+        "OK "*)         pass "Python: ${line#OK }" ;;
+        "FAIL "*)       fail "Python: ${line#FAIL }" ;;
+        "PY-version "*) pass "Python: ${line#PY-version }" ;;
+        *) printf '       %s\n' "$line" ;;
+    esac
+done <<<"$py_report"
+[[ $py_exit -ne 0 ]] && failures=$((failures + 1))
+
+# ─── Quarto + Typst ───────────────────────────────────────────────────
+# The manuscript uses Quarto's bundled Typst engine for PDF rendering,
+# so there's no separate PDF-engine binary to check — Quarto ships
+# Typst as `quarto typst …` and resolves it internally during `quarto
+# render`.
+echo
+echo "=== Quarto ==="
+if quarto --version >/dev/null 2>&1; then
+    pass "Quarto $(quarto --version)"
+else
+    fail "Quarto not on PATH"
+fi
+if quarto typst --version >/dev/null 2>&1; then
+    pass "Quarto's bundled Typst: $(quarto typst --version 2>&1 | head -1)"
+else
+    fail "Quarto's bundled Typst not callable — PDF render of sat_model.qmd will fail"
+fi
+
+# ─── Stan posterior draws (50 per-imputation files + meta) ─────────────
+echo
+echo "=== Stan posterior draws ==="
+warn() { printf '  WARN  %s\n' "$1"; }
+DRAWS_DIR="replicated/sims/mi"
+SUBMITTED_DRAWS_DIR="submitted/sims/mi"
+if [[ -d "$DRAWS_DIR" ]]; then
+    n_imp=$(find "$DRAWS_DIR" -maxdepth 1 -name 'imp_*.rds' | wc -l | tr -d ' ')
+    if [[ "$n_imp" -eq 50 && -f "$DRAWS_DIR/meta.rds" ]]; then
+        pass "$DRAWS_DIR/ has 50 imp_*.rds + meta.rds ($(du -sm "$DRAWS_DIR" | cut -f1) MB total)"
+    else
+        fail "$DRAWS_DIR/ has $n_imp imp_*.rds files (expected 50) and meta.rds $( [[ -f $DRAWS_DIR/meta.rds ]] && echo present || echo missing )"
+    fi
+else
+    warn "$DRAWS_DIR/ missing — run bin/generate sims (or bin/restore sims to copy back from submitted/)"
+fi
+if [[ -d "$SUBMITTED_DRAWS_DIR" ]]; then
+    n_imp_subm=$(find "$SUBMITTED_DRAWS_DIR" -maxdepth 1 -name 'imp_*.rds' | wc -l | tr -d ' ')
+    if [[ "$n_imp_subm" -eq 50 && -f "$SUBMITTED_DRAWS_DIR/meta.rds" ]]; then
+        pass "$SUBMITTED_DRAWS_DIR/ has 50 imp_*.rds + meta.rds (bin/compare sims is meaningful)"
+    else
+        warn "$SUBMITTED_DRAWS_DIR/ has $n_imp_subm/50 imp_*.rds files — incomplete frozen mirror"
+    fi
+else
+    warn "$SUBMITTED_DRAWS_DIR/ missing — bin/compare sims will report no-mirror until the canonical fit is frozen there"
+fi
+
+# ─── reproducibility env vars ──────────────────────────────────────────
+echo
+echo "=== reproducibility env ==="
+for var in CMDSTAN CMDSTAN_VERSION CMDSTANR_VERSION PDFPLUMBER_VERSION \
+           BS4_VERSION PPM_SNAPSHOT SOURCE_DATE_EPOCH; do
+    if [[ -n "${!var:-}" ]]; then
+        pass "$var=${!var}"
+    else
+        fail "$var not set"
+    fi
+done
+
+echo
+if (( failures == 0 )); then
+    printf 'All checks passed.\n'
+    exit 0
+fi
+printf '%d check(s) failed.\n' "$failures"
+exit 1

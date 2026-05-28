@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# bin/release_docs — render documents/sat_model.qmd ONCE in this
+# environment and write the resulting docx/html/pdf to BOTH
+# replicated/docs/ and submitted/docs/.
+#
+# Why this script exists, and why you should run it inside the
+# Codespace (not on your laptop):
+#
+#   Quarto and Typst output is byte-sensitive to the rendering
+#   environment — system fonts, exact Typst version, pandoc version,
+#   even the underlying glibc on Linux. A docx or pdf rendered on
+#   macOS will not byte-match the same .qmd rendered in the Codespace,
+#   even with identical Quarto and Typst versions installed.
+#
+#   Replication users open a Codespace and run `bin/everything docs`,
+#   which renders into replicated/docs/. For `bin/compare docs` to be
+#   a meaningful check, submitted/docs/ has to contain a Codespace
+#   render too — otherwise the canonical and the just-replicated
+#   trees disagree byte-for-byte for environment reasons alone.
+#
+#   So the rule is: the *author* runs this script inside a Codespace
+#   when releasing a new version of the manuscript, never on a laptop.
+#   It renders sat_model.qmd once and writes the bytes to both trees
+#   in lockstep, so anyone who reruns the pipeline in a Codespace
+#   afterwards will get byte-identical artifacts.
+#
+# Renders ONLY sat_model.qmd. The ancillary qmds (abstract.qmd,
+# cover_letter.qmd, lede.qmd, title_page.qmd) are gitignored
+# author-only files; this script does not touch them.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Light sanity check: warn (don't block) if we obviously aren't in a
+# Codespace. The script will still run on a laptop — it just won't
+# produce bytes that match what users see when they replicate.
+if [[ -z "${CODESPACES:-}" && -z "${GITHUB_CODESPACE_NAME:-}" ]]; then
+    cat >&2 <<EOF
+
+WARNING: \$CODESPACES / \$GITHUB_CODESPACE_NAME not set — this looks
+like a local environment. Quarto/Typst output is byte-sensitive, so
+the docx/pdf you produce here will likely NOT byte-match a Codespace
+render. If you intend the result to be the canonical submitted/
+artifact, run this inside a Codespace instead.
+
+(Proceeding anyway; press Ctrl-C in the next 3 seconds to abort.)
+
+EOF
+    sleep 3
+fi
+
+echo "=== [1/3] rendering documents/sat_model.qmd ==="
+(cd documents && quarto render sat_model.qmd --output-dir ../replicated/docs)
+
+echo
+echo "=== [2/3] verifying replicated/docs/ outputs ==="
+for ext in docx html pdf; do
+    src="replicated/docs/sat_model.$ext"
+    if [[ ! -f "$src" ]]; then
+        echo "ERROR: $src missing after render" >&2
+        exit 1
+    fi
+    printf '  OK   %-26s %s bytes\n' "sat_model.$ext" "$(wc -c < "$src" | tr -d ' ')"
+done
+
+echo
+echo "=== [3/3] syncing replicated/docs/ → submitted/docs/ ==="
+for ext in docx html pdf; do
+    cp -a "replicated/docs/sat_model.$ext" "submitted/docs/sat_model.$ext"
+done
+# cp -a should produce byte-identical copies, but verify defensively
+# — if cmp ever reports DRIFT here the filesystem is doing something
+# surprising and the rest of the release procedure is unsafe.
+for ext in docx html pdf; do
+    if cmp -s "replicated/docs/sat_model.$ext" "submitted/docs/sat_model.$ext"; then
+        echo "  OK   sat_model.$ext byte-identical between replicated/ and submitted/"
+    else
+        echo "  FAIL sat_model.$ext (cp did not produce identical bytes)" >&2
+        exit 1
+    fi
+done
+
+cat <<EOF
+
+Done.  Both replicated/docs/sat_model.{docx,html,pdf} and
+submitted/docs/sat_model.{docx,html,pdf} now hold this Codespace
+render.
+
+Next steps (run from this same Codespace, so the bytes you've just
+written are what's about to be committed):
+  git status -sb
+  git diff documents/sat_model.qmd        # eyeball the source change
+  git add -A
+  git commit -m "<your message>"
+  git push origin main
+EOF

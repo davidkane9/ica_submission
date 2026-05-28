@@ -1,0 +1,118 @@
+{
+    "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
+    "name": "ICA SAT scores (R + Python + Stan)",
+
+    // Pinned by sha256 digest so the base image (R 4.5.x + system libs
+    // for compiling R packages) is reproducible. The :4.5 tag is for
+    // human readability — the digest is what Docker resolves. This is
+    // the minimal rocker R devcontainer image; tidyverse, Quarto, and
+    // the Stan toolchain are layered on in post-create.sh.
+    "image": "ghcr.io/rocker-org/devcontainer/r-ver@sha256:40714b9f6327f7684c1b9af10e355da1413d5dda1cd97dafb43e61e540c8bdd1",
+
+    // Every feature is pinned to an exact patch-level version tag so
+    // a published feature can't silently change underneath us. (The
+    // alternative — pinning by @sha256 digest — is parseable by the
+    // devcontainer CLI but flagged as invalid by the json-schema
+    // validator at https://github.com/microsoft/vscode-remote-release/issues/11241,
+    // so we use the immutable version tag instead.) To bump a feature,
+    // check ghcr.io for its latest release tag and update here.
+    "features": {
+        "ghcr.io/devcontainers/features/python:1.8.0": {
+            "version": "3.11.15",
+            "installTools": true
+        },
+        "ghcr.io/rocker-org/devcontainer-features/quarto-cli:1.1.5": {
+            "version": "1.8.27",
+            // No TinyTeX: the manuscript's PDF format is Typst, not
+            // LaTeX. Typst is bundled with Quarto, so no separate
+            // PDF-engine install is needed.
+            "installTinyTex": false,
+            "installChromium": false
+        },
+        "ghcr.io/devcontainers/features/common-utils:2.5.9": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": false,
+            "upgradePackages": false
+        }
+    },
+
+    "hostRequirements": {
+        "cpus": 8,
+        "memory": "32gb",
+        "storage": "64gb"
+    },
+
+    // Block tools (VS Code, Codespaces editor, devcontainer CLI) from
+    // attaching the terminal until post-create.sh has finished. Without
+    // this, a user can open a terminal mid-build and see spurious
+    // failures (R packages or pdfplumber not yet installed) — exactly
+    // the mode we hit in early codespaces.
+    "waitFor": "postCreateCommand",
+
+    "containerEnv": {
+        "CMDSTAN": "/opt/cmdstan/cmdstan-2.39.0",
+        // CRAN snapshot date — every R package install in post-create.sh
+        // is resolved against this frozen Posit Package Manager mirror,
+        // so the full transitive dependency graph is identical on
+        // every re-build.
+        "PPM_SNAPSHOT": "2026-05-24",
+        // Fixes the build timestamp embedded by pandoc (so DOCX, HTML)
+        // and by xelatex (so PDF) so re-rendering the manuscript on a
+        // different day still produces byte-identical files — needed
+        // for bin/compare to succeed against submitted/. Value is
+        // 2026-01-01 00:00:00 UTC; any fixed integer would do.
+        "SOURCE_DATE_EPOCH": "1767225600",
+        // Upstream versions pinned in post-create.sh. tidyverse and the
+        // other CRAN packages we install are pinned transitively by
+        // PPM_SNAPSHOT, so they do not need explicit version strings
+        // here — only the things installed outside PPM do.
+        "CMDSTANR_VERSION": "0.9.0",
+        "CMDSTAN_VERSION": "2.39.0",
+        "PDFPLUMBER_VERSION": "0.11.9",
+        "BS4_VERSION": "4.13.4"
+        // (Do NOT add PATH here. Codespaces does not substitute
+        // ${containerEnv:PATH} when assembling docker-run -e flags;
+        // it gets passed as a literal string, which wipes the
+        // container's PATH and kills /bin/sh. Earlier we used this
+        // to put TinyTeX on PATH; now that we render PDFs with Typst
+        // — bundled inside Quarto — no extra PATH munging is needed.)
+    },
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "REditorSupport.r-syntax",
+                "REditorSupport.r",
+                "RDebugger.r-debugger",
+                "ms-python.python",
+                // ms-python.vscode-pylance deliberately omitted: it is
+                // closed-source Microsoft software with a license that
+                // refuses to activate in some Codespaces / non-official
+                // VS Code builds, surfacing as a "license popup" error
+                // and a "couldn't create connection to server" error.
+                // ms-python.python gives us all the basics we need.
+                "ms-toolsai.jupyter",
+                "quarto.quarto",
+                // Render PDFs inline in a VS Code tab (so e.g.
+                // replicated/docs/sat_model.pdf opens directly instead
+                // of needing a download). Lightweight, no dependencies.
+                "tomoki1207.pdf"
+            ],
+            "settings": {
+                // r.rpath.linux is what the R extension uses for help
+                // lookup, package installs, etc. (a non-interactive
+                // R invocation). r.rterm.linux is the path used when
+                // the user runs the "R: Create R Terminal" command.
+                // The two are intentionally separate; set both.
+                "r.rpath.linux": "/usr/local/bin/R",
+                "r.rterm.linux": "/usr/local/bin/R",
+                "r.bracketedPaste": true,
+                "python.defaultInterpreterPath": "/usr/local/python/current/bin/python"
+            }
+        }
+    },
+
+    "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+    "remoteUser": "rstudio"
+}

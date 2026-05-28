@@ -1,0 +1,1505 @@
+---
+# Intelligence & Cognitive Abilities (ICA) — submission checklist:
+#   * Research Article. Style: APA 7th (csl: apa.csl below). Manuscript in
+#     MS Word, ≤ 10,000 words including abstract, main text, references,
+#     tables, figures, notes; Times New Roman or Arial 12 pt, double
+#     spaced, left aligned, no line numbers (set via the reference-doc
+#     on the `docx` format below); no appendices.
+#   * Double-blind: the submission manuscript must be anonymized — strip
+#     this author block and affiliation, the repo URL in "Data and code
+#     availability", and any other self-identifying reference. A complete
+#     title page goes in a SEPARATE file (reviewers do not see it).
+#   * Four additional files accompany the manuscript: Title Page (authors,
+#     institutions, contacts); Cover Letter (article type, IRB/conflicts,
+#     corresponding author, total word count, "not under consideration
+#     elsewhere", two suggested reviewers, commitment to the publication
+#     fee); Abstract (separate file, ≤ 300 words); Lede / "highlights"
+#     (≤ 30 words). Stubs: title_page.qmd, cover_letter.qmd, abstract.qmd,
+#     lede.qmd in this directory. Queries: thomas.coyle@utsa.edu.
+title: "A Model for the Distribution of SAT Total Scores"
+# Anonymized for double-blind review: the author block, affiliations,
+# acknowledgements, and repository URL have been removed from this file.
+# Identifying information is in title_page.qmd and cover_letter.qmd,
+# which are submitted separately and not seen by reviewers.
+# The abstract is rendered as the first body section below (rather
+# than via YAML `abstract:`) so its headline numbers can be inline-R
+# expressions tied to the same posterior as the rest of the paper.
+keywords: [SAT, score distributions, grouped data, sinh-arcsinh distribution, hierarchical Bayesian model, tail estimation]
+bibliography: references.bib
+csl: apa.csl
+google-scholar: true
+link-citations: true
+format:
+  html:
+    toc: false
+    number-sections: false
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+    theme: cosmo
+    fig-cap-location: bottom
+    tbl-cap-location: top
+    include-in-header:
+      text: |
+        <style>
+        .quarto-figure figcaption,
+        .quarto-float-tbl figcaption,
+        .quarto-float-fig figcaption,
+        figure > figcaption,
+        caption,
+        .table-caption,
+        .figure-caption { text-align: left !important; }
+        </style>
+  docx:
+    number-sections: false
+    fig-width: 6.5
+    fig-height: 4
+    reference-doc: ica-manuscript.docx   # Times New Roman 12 pt, double spacing, left alignment, no line numbers (ICA requirement)
+  typst:
+    number-sections: false
+    fig-width: 6.5
+    fig-height: 4
+    fig-cap-location: bottom
+    tbl-cap-location: top
+    papersize: us-letter
+    margin:
+      x: 1in
+      y: 1in
+---
+
+```{r}
+#| label: setup
+#| include: false
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(ggplot2)
+  library(scales)
+  library(knitr)
+  library(posterior)
+})
+
+# Shared figure look-and-feel.  Per-figure theme() calls below should
+# only add what this default doesn't already cover (e.g., rotating
+# x-axis text on a single figure).
+theme_set(theme_minimal(base_size = 11) +
+          theme(panel.grid.minor = element_blank(),
+                legend.position  = "bottom",
+                strip.text       = element_text(face = "bold", size = 10),
+                axis.title       = element_text(size = 10),
+                axis.text        = element_text(size = 9),
+                plot.caption     = element_text(size = 8, hjust = 0)))
+
+# Load the MI posterior (50 per-imputation .rds files + meta.rds) and
+# the CSV-derived data arrays (N, mu_printed, p_obs, P_OBS).  Both
+# documents/sat_model.qmd and documents/_headlines.R source this
+# helper so they share a single derivation of the "data the model was
+# fit to" — read straight from the per-year race CSVs, no auxiliary
+# .rds dependency.  ../code/run_fit_mi.R produced the draws.
+source("_inputs.R")
+
+# Reconstruct the .mi_obj convenience bundle that the diagnostics
+# chunk below references — it's just the meta fields merged onto the
+# draws matrix, no extra computation.
+.mi_obj <- c(list(draws = .draws_dm), .mi_meta)
+
+# Local DRAWS wrapper providing a cmdstanr-like interface over the
+# reassembled MI draws matrix (.draws_dm), so the rest of the qmd can
+# call DRAWS$draws(), DRAWS$summary(), DRAWS$diagnostic_summary().
+DRAWS <- list(
+  draws = function(variables = NULL, format = "matrix") {
+    out <- if (is.null(variables)) .draws_dm
+           else subset_draws(.draws_dm, variable = variables, regex = FALSE)
+    if (format == "matrix") return(out)
+    if (format == "draws_df") return(as_draws_df(out))
+    stop("format not supported: ", format)
+  },
+  summary = function(variables = NULL, ...) {
+    out <- if (is.null(variables)) .draws_dm
+           else subset_draws(.draws_dm, variable = variables, regex = FALSE)
+    summarise_draws(out, ...)
+  },
+  diagnostic_summary = function() {
+    list(num_divergent = .n_div_mi, num_max_treedepth = 0)
+  }
+)
+
+# Undot the shared names for readability in the rest of the document.
+RACES <- .RACES
+YEARS <- .YEARS
+SD    <- list(N = .N_arr, mu_printed = .mu_arr, p_obs = .p_obs)
+P_OBS <- .P_OBS
+# RACES order from the driver: White, Hispanic/Latino, Black/African American,
+# Asian, Two or More Races, American Indian/Alaska Native, Native Hawaiian/
+# Other Pacific Islander, No Response. Keep RACE_LABEL aligned to it.
+stopifnot(identical(RACES, c("White", "Hispanic/Latino", "Black/African American",
+                             "Asian", "Two or More Races",
+                             "American Indian/Alaska Native",
+                             "Native Hawaiian/Other Pacific Islander", "No Response")))
+RACE_LABEL <- c("White", "Hispanic/Latino", "Black", "Asian",
+                "Two or more", "Am. Indian", "Pacific Isl.", "No response")
+BAND_LABEL <- c("400--590", "600--790", "800--990",
+                "1000--1190", "1200--1390", "1400--1600")
+# SAT total scores come in 10-point steps, so the band cut points sit at
+# the mid-gap values (the "400-590"/"600-790" boundary is at 595, not 600).
+BAND_EDGE  <- c(595, 795, 995, 1195, 1395)   # interior cut points
+
+# Renormalise the observed band proportions to an exact simplex (as the
+# Stan transformed-data block does).
+P_OBS <- SD$p_obs
+for (r in seq_along(RACES))
+  for (y in seq_along(YEARS))
+    P_OBS[r, y, ] <- P_OBS[r, y, ] / sum(P_OBS[r, y, ])
+
+# Standard (location-0, scale-1) sinh-arcsinh CDF, and its location-scale form.
+shash_F  <- function(x, eps, delta) pnorm(sinh(delta * asinh(x) - eps))
+shash_Fs <- function(s, mu, sigma, eps, delta) shash_F((s - mu) / sigma, eps, delta)
+
+# Reportable SAT total scores, and the upper edge of each one's rounding
+# bin; the discrete percentile (the College Board's convention) of a pmf
+# on this grid: smallest grid score whose cumulative probability >= p.
+GRIDX <- seq(400, 1600, by = 10)
+GRIDE <- c(GRIDX[-1] - 5, Inf)
+qgrid <- function(p, cdf, x) { k <- which(cdf >= p)[1]; if (is.na(k)) x[length(x)] else x[k] }
+
+ai <- match("Asian", RACES)
+bi <- match("Black/African American", RACES)
+wi <- match("White", RACES)
+hi <- match("Hispanic/Latino", RACES)
+y25 <- match(2025, YEARS)
+
+# Headline numbers quoted in this manuscript's prose.  Defined in
+# _headlines.R, sourced here so the abstract, the body, and the
+# separately rendered abstract.qmd and cover_letter.qmd all pull from
+# one place and cannot drift.  When moving this .qmd to another
+# repository, copy _headlines.R along with it.
+source("_headlines.R")
+```
+
+# Abstract {.unnumbered}
+
+The College Board's SAT is the most widely used standardized test for
+college and university admissions in the United States, with
+approximately two million test-takers in each graduating class. The College Board does not release anonymized
+individual-level scores, so a question like "what share of students
+scoring at least 1500 are Black?" cannot be answered directly from the
+published data. The College Board's *SAT Suite of Assessments Annual
+Report* does include, for seven racial/ethnic groups across high
+school graduating classes from 2018 through 2025, the percentage of
+test-takers in each of six wide score bands. An eighth category ("No
+response") is derived by subtraction from the published cohort band
+counts. We fit a Bayesian hierarchical model to the score band
+percentages using per-group censored sinh-arcsinh curves (the seven
+named groups under a shared log-linear scale-trend hierarchy; the
+No response group with a free per-year scale). We
+validate the fit by holding out five published cohort numbers per year
+(the mean, standard deviation, and three quartile scores) and an
+independent fine-grained percentile reference table, none of which
+is used during model fitting, and then checking that the fitted
+distribution approximates them. For the graduating class of 2025, we
+estimate that approximately `r blk_1500_med`% of SAT-takers
+scoring 1500 or higher are Black (95% credible interval
+`r blk_1500_lo`%–`r blk_1500_hi`%).
+
+# Introduction
+
+The College Board's SAT [@lemann1999bigtest; @collegeboard_techmanual]
+is the most widely used standardized test for college and university
+admissions in the United States, with approximately two million
+test-takers in each graduating class. Total scores correlate around
+0.8 with omnibus measures of general cognitive ability on the pre-2005
+SAT [@freydetterman2004] and predict post-secondary academic
+performance [@sackettkuncelhezlett2009; @kuncelhezlett2010;
+@kobrinpatterson2011]. Selective colleges and merit-scholarship
+programs impose explicit or de facto thresholds on it.
+
+The College Board does not release anonymized individual-level scores.
+However, it does publish, for seven racial/ethnic groups, the
+percentage of that group's test-takers in each of six wide total-score
+bands. A question like *what share of students scoring at least 1500
+in a given graduating class are Black?*, exactly the kind of
+compositional question that selective-admissions and scholarship
+policy depend on, cannot be answered directly from those bands. The
+1500 threshold falls inside the top band (1400--1600).
+Mean group differences on the SAT and on cognitive-ability
+assessments more broadly have been documented for decades
+[@roth2001ethnic; @hauser2002; @reardon2011;
+@reardonkalogridesshores2019], but the *shape* of each group's
+upper tail, which determines who clusters above any selective cutoff,
+is not visible from the published summaries alone.
+
+The curves estimated here describe SAT *test-takers*, not the broader
+U.S. 18-year-old population. The test-taker cohort is the
+policy-relevant population for admissions and scholarship decisions
+that condition on an SAT score. Mapping these quantities back to the
+broader cohort would require a separate model of test participation
+which we do not attempt here.
+
+The College Board's annual *SAT Suite of Assessments Annual Report*
+[@collegeboard_annual] gives, for each graduating class from 2018
+through 2025, the number of test-takers and the mean total score on
+the 400--1600 scale for each of eight racial/ethnic categories (the
+seven named in the report, plus a "No response" residual we treat
+as an eighth), and the percentage (integer-rounded) of the group's
+test-takers in each of six wide score bands for the seven named
+groups only (the No response band counts are derived by subtraction
+from the published cohort band totals). The published cohort
+SD, quartiles, and fine-grained percentile reference table
+[@collegeboard_percentiles] are held out as external checks.
+
+We model the latent total score for each (group, year) as a
+censored sinh-arcsinh ("SHASH") random variable, with the eight
+per-group curves fit jointly via Bayesian hierarchical Hamiltonian
+Monte Carlo and a Dirichlet likelihood on the band percentages whose
+dispersion is decoupled from group size. Methods gives the full
+specification.
+
+The fit is validated against the cohort quartiles (a test of the
+model's calibration at three interior points; the model is never
+shown these quartiles) and an independent
+fine-grained percentile reference table [@collegeboard_percentiles].
+Against the percentile reference, properly read against the integer
+rounding of the published table, the model is consistent with the
+published values throughout the body of the distribution and through
+the headline threshold $t = 1500$, with a mild residual at $t = 1550$
+(see Validation).
+
+For the graduating class of 2025, approximately `r blk_1400_pct`%
+of SAT-takers scoring 1400 or higher are Black, a share that involves
+no model interpolation, since 1400 is a reported band boundary, and
+follows directly from the College Board's published numbers. The corresponding share at 1500 cannot be
+read off the published numbers because 1500 sits inside the top
+reported band. The Black share of the 1500 or higher pool is estimated at
+approximately `r blk_1500_med`%, with a 95% credible interval running
+from `r blk_1500_lo`% to `r blk_1500_hi`%. The 1500 figure
+involves interpolation within the top reported band, and the
+implied cohort share at $t = 1500$, for the pooled 2023--2025
+cohort, is consistent with the integer-rounded value in the College
+Board's SAT User Percentile reference table for that same pooled
+window. The model estimates an Asian-to-Black ratio of about
+`r ab_1500_med`:1 among test-takers scoring 1500 or higher (95%
+credible interval `r ab_1500_lo`:1 to `r ab_1500_hi`:1).
+
+# Data
+
+The data are drawn from the *SAT Suite of Assessments Annual Report*
+[@collegeboard_annual] for the graduating classes of 2018 through 2025.
+Each report tabulates, by race/ethnicity, the number of test-takers, the
+mean total score (on the 400–1600 scale), and the percentage of
+test-takers whose total score falls in each of six bands: 400–590,
+600–790, 800–990, 1000–1190, 1200–1390, and 1400–1600. The reports
+identify seven racial/ethnic categories (White, Black/African American,
+Hispanic/Latino, Asian, Two or More Races, American Indian/Alaska
+Native, and Native Hawaiian/Other Pacific Islander) and also report
+totals for the full cohort, which is larger than the sum of the seven
+because some test-takers decline to report a category.^[Throughout the
+tables and figures we abbreviate the longer labels: "Black" for
+Black/African American, "Two or more" for Two or More Races, "Am.
+Indian" for American Indian/Alaska Native, "Pacific Isl." for Native
+Hawaiian/Other Pacific Islander, and "No response" for the residual
+described below.]
+
+@tbl-pdf reproduces the seven per-group rows the report prints for the
+graduating class of 2025, with the numbers shown exactly as printed
+(group order in the table does not follow the report's print order).
+Three features of
+that raw table matter for what follows. First, the band percentages
+are rounded to integers. Second, one of those rounded values is
+zero (Asian in 400--590), meaning the true value is in $[0, 0.5)$
+rather than that no test-taker in that group scored in that band.
+Third, because of integer rounding the six bands of a given group
+need not sum to exactly 100. The report also publishes test-takers
+and mean total score for an eighth row, "No response", which contains
+test-takers who did not disclose a race or ethnicity, but the report
+does not print band percentages for that row.
+
+```{r}
+#| label: tbl-pdf
+#| echo: false
+#| tbl-cap: "**Per-Group Inputs from the 2025 SAT Suite Annual Report.** Test-takers ($N$), mean total score, and the percentage of each group's test-takers in each of six total-score bands, as printed by the College Board. Band percentages are integers as printed and may not sum to 100 because of rounding."
+raw_pdf <- read.csv("../replicated/data/race/raw/2025.csv", stringsAsFactors = FALSE)
+NAMED7 <- setdiff(RACES, "No Response")
+NAMED7_LABEL <- RACE_LABEL[match(NAMED7, RACES)]
+idx <- match(NAMED7, raw_pdf$race)
+data.frame(
+  Group   = NAMED7_LABEL,
+  N       = format(raw_pdf$N[idx], big.mark = ",", trim = TRUE),
+  Mean    = raw_pdf$mean[idx],
+  `400--590`    = raw_pdf$b_400_590   [idx],
+  `600--790`    = raw_pdf$b_600_790   [idx],
+  `800--990`    = raw_pdf$b_800_990   [idx],
+  `1000--1190`  = raw_pdf$b_1000_1190 [idx],
+  `1200--1390`  = raw_pdf$b_1200_1390 [idx],
+  `1400--1600`  = raw_pdf$b_1400_1600 [idx],
+  check.names = FALSE,
+  row.names = NULL
+) |>
+  kable(align = c("l", rep("r", 8)), row.names = FALSE)
+```
+
+The model does not fit @tbl-pdf. The
+printed integer percentages are an integer-rounded representation of
+a vector of true band proportions that is not observed. The fit
+therefore draws $M$ datasets from the rounding-induced posterior over
+plausible per-(group, year) band-proportion vectors, fits the
+SHASH+Dirichlet model to each, and pools the $M$ sets of posterior
+draws (multiple imputation; see *A Dirichlet Likelihood on Band
+Proportions*). Each imputation proceeds in two steps. First,
+for each named-group row, we draw a six-cell proportion vector
+uniformly from the *rounding-box-intersected simplex*: the set of
+$(\pi_1, \dots, \pi_6)$ satisfying $\pi_b \in [(k_b - 0.5)/100,\,
+(k_b + 0.5)/100)$ for each band $b$ (with the lower edge clamped at
+$0$ when $k_b = 0$) and $\sum_b \pi_b = 1$. Operationally, we sample
+five cells independently from their intervals, set the sixth to
+$1 - \sum$, and accept only if the sixth lies in its own rounding
+interval; the accepted draws are within their rounding intervals
+by construction and sum to one without any renormalization step.
+Second, we derive the No response band counts by subtraction from the
+exact published cohort band counts. The College Board publishes the
+cohort *Total* row's band counts as integers (not as rounded
+percentages), so the cohort row carries no rounding error of its
+own, and the imputation's No response count in each band is the
+cohort count minus the sum of the seven named-group counts implied
+by their sampled percentages.
+
+Because the procedure samples afresh on every imputation, there is no
+single cleaned table the model fits. The pooled posterior across
+$M = 50$ imputations reflects band-rounding uncertainty in addition
+to whatever uncertainty the Dirichlet likelihood already captures.
+
+Two further College Board sources are held out for validation only
+and are described below where they are used (see Validation): the
+published cohort summaries (mean, SD, and three quartiles per year)
+and the
+*SAT User Percentile* reference table
+[@collegeboard_percentiles], constructed from individual scores in
+ten-point steps.
+
+```{r}
+#| label: fig-data-trends
+#| echo: false
+#| fig-cap: "**Mean Total Score and Band-Midpoint SD by Group, 2018--2025.** Left: published mean total score. Right: SD computed by placing each band's mass at its nominal midpoint $500, 700, 900, 1100, 1300, 1500$ (the exact 10-point-grid midpoints are $495, 695, 895, 1095, 1295, 1500$; only the last falls on the round-hundred grid, because the top band 1400--1600 is 200 points wide rather than 190). The band-midpoint SD is a coarse proxy for each group's within-group SD, not the published cohort SD recovered in Validation."
+#| fig-width: 9
+#| fig-height: 4
+MID <- c(500, 700, 900, 1100, 1300, 1500)
+trends_mean <- tibble(
+  race  = rep(RACE_LABEL, length(YEARS)),
+  year  = rep(YEARS, each = length(RACE_LABEL)),
+  panel = "Mean total score",
+  value = as.vector(SD$mu_printed)
+)
+band_mid_sd <- sapply(seq_along(YEARS), function(yi) {
+  sapply(seq_along(RACES), function(r) {
+    p  <- P_OBS[r, yi, ]
+    mn <- sum(p * MID)
+    sqrt(sum(p * (MID - mn)^2))
+  })
+})
+trends_sd <- tibble(
+  race  = rep(RACE_LABEL, length(YEARS)),
+  year  = rep(YEARS, each = length(RACE_LABEL)),
+  panel = "Band-midpoint SD",
+  value = as.vector(band_mid_sd)
+)
+trends <- bind_rows(trends_mean, trends_sd) |>
+  mutate(panel = factor(panel, levels = c("Mean total score", "Band-midpoint SD")),
+         race  = factor(race,  levels = RACE_LABEL))
+ggplot(trends, aes(year, value, color = race, group = race)) +
+  geom_line(linewidth = 0.7) + geom_point(size = 1.8) +
+  facet_wrap(~ panel, scales = "free_y") +
+  scale_x_continuous(breaks = YEARS, labels = function(b) substr(as.character(b), 3, 4)) +
+  scale_color_brewer(palette = "Dark2", name = NULL) +
+  labs(x = "Graduating-class year ('18–'25)", y = "Score points")
+```
+
+Two features of @fig-data-trends matter for the modeling choices
+that follow. First, the No response *mean* drifts gently between approximately
+949 and 996 across 2018–2024 and then steps to approximately 1055 in
+2025, a roughly 100-point one-year jump with no parallel in any named
+group, whose means move smoothly across the period. The model fits this
+because every (group, year) cell has its own free mean parameter
+$\theta_{r,y}$ under a weakly informative prior. No smoothness across
+years is imposed on any group's mean. Second, the No response
+*standard deviation* rises from approximately 211 in 2018 to
+approximately 287 in 2025, a 76-point increase that dwarfs the
+9–27-point rises shown by the seven named groups, and the rise is not
+a smooth drift but a step pattern, with most of the jump appearing in
+2020 and a further jump in 2025. The smooth log-linear scale trend the
+named groups follow cannot reproduce that step structure, so the model
+gives No response a free per-year scale parameter, decoupled from the
+named-group hierarchy, as detailed below. No claim is made about the cause of
+these movements in the No response numbers. The public record does
+not distinguish a shift in who declines to disclose from a stable
+population changing how it self-identifies.
+
+```{r}
+#| label: fig-band-composition
+#| echo: false
+#| fig-cap: "**Score-Band Composition over Time, by Group.** Each panel shows one racial/ethnic group. Within a panel, score band runs along the horizontal axis and the eight side-by-side bars within each band give the percentage of the group's test-takers in that band, by graduating-class year from 2018 (darkest) through 2025 (lightest)."
+#| fig-width: 10
+#| fig-height: 6.5
+band_long <- purrr::map_dfr(seq_along(RACES), function(r) {
+  purrr::map_dfr(seq_along(YEARS), function(yi) {
+    tibble(race    = RACE_LABEL[r],
+           year    = factor(YEARS[yi], levels = YEARS),
+           band    = BAND_LABEL,
+           percent = 100 * P_OBS[r, yi, ])
+  })
+}) |> mutate(race = factor(race, levels = RACE_LABEL),
+             band = factor(band, levels = BAND_LABEL))
+ggplot(band_long, aes(band, percent, fill = year)) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.85) +
+  facet_wrap(~ race, ncol = 4) +
+  scale_fill_viridis_d(option = "D", name = "Year") +
+  labs(x = "Score band", y = "Percent of group's test-takers") +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(0.6, "lines"),
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 7.5),
+        strip.text = element_text(size = 9, face = "bold"))
+```
+
+@fig-band-composition makes two further patterns visible. The first
+is the year-to-year *stability* of most named-group band shares: the
+1400--1600 share moves by at most two or three percentage points for
+every named group, with similarly narrow ranges across the bands and
+across the smaller groups, and for most named-group bands the eight
+side-by-side bars are close to the same height, leaving the model's
+year-constant skewness and tail-weight little to fit against. The second is a steady decline in the
+1000–1190 band across White, Black, and Hispanic/Latino test-takers,
+mirroring the slow downward drift in those groups' means in
+@fig-data-trends.
+
+# Methods
+
+The model has three structural components: a flexible parametric shape
+for each group's score distribution, a likelihood that connects the
+shape to the rounded band proportions, and a hierarchical structure
+that ties the per-group parameters together. The three are described
+in turn, followed by the priors and the estimation procedure.
+
+## A Censored Sinh-Arcsinh Shape {#sec-shape}
+
+For racial/ethnic group $r$ ($r = 1, \dots, 8$) and graduating-class
+year $y$, we model an individual total score $S$ as a sinh-arcsinh
+("SHASH") random variable [@jonespewsey2009], a
+four-parameter generalization of the normal with separate parameters
+for asymmetry and tail-thickness, used within the GAMLSS framework
+for individual-level distributional modeling
+[@rigbystasinopoulos2005; @stasinopoulosrigby2007]. If
+$Z \sim \mathcal{N}(0, 1)$, the standardized SHASH variable is
+
+$$
+X \;=\; \sinh\!\left(\frac{\operatorname{asinh}(Z) + \epsilon}{\delta}\right),
+\qquad \delta > 0,
+$$ {#eq-shash}
+
+and the score is $S = \mu_{r,y} + \sigma_{r,y} X$, with location
+$\mu_{r,y}$, scale $\sigma_{r,y}$, skewness $\epsilon_r$, and
+tail-weight $\delta_r$; $\epsilon = 0,\, \delta = 1$ recovers the
+standard normal, $\delta < 1$ gives heavier tails and $\delta > 1$
+lighter. The skewness and tail-weight are group-level and
+year-constant, pooled hierarchically; the location is a free
+per-(group, year) parameter under a weakly informative prior, with
+the published mean playing no part. The scale varies by year through
+a per-group log-linear trend plus a small per-cell residual.
+
+Because $\sinh$ and $\operatorname{asinh}$ are monotone, the SHASH CDF
+is the normal CDF $\Phi$ composed with the inverse transformation:
+
+$$
+F(s \mid \mu, \sigma, \epsilon, \delta)
+  \;=\; \Phi\!\left(\sinh\!\left(\delta\,\operatorname{asinh}\!\frac{s - \mu}{\sigma} - \epsilon\right)\right).
+$$ {#eq-cdf}
+
+Censoring at the reporting range is handled by folding it into the
+band boundaries. SAT total scores are reported in 10-point steps, so
+the latent cut between bands "400--590" and "600--790" sits at the
+midpoint of the gap, 595, and the interior cuts likewise at 795,
+995, 1195, 1395. With edges
+$(-\infty, 595, 795, 995, 1195, 1395, +\infty)$, the bottom band
+collects mass the smooth distribution would place below 400 and the
+top band mass above 1600, so the model probability that a member of
+group $r$ in year $y$ falls in band $b$ is
+
+$$
+\pi_{r,y,b} \;=\; F(e_b \mid \mu_{r,y}, \sigma_{r,y}, \epsilon_r, \delta_r)
+                 - F(e_{b-1} \mid \mu_{r,y}, \sigma_{r,y}, \epsilon_r, \delta_r),
+$$ {#eq-bandprob}
+
+a difference of two closed-form CDF evaluations. The same 10-point
+convention applies to threshold questions later (a reported score
+$\ge t$ corresponds to a latent score $\ge t-5$). The model fits on
+latent scores; the censoring fold means that any latent mass the
+SHASH would put above 1600 is assigned to the 1400--1600 band, and
+the band probabilities are computed accordingly. Threshold queries
+$P(\text{score} \ge t)$ are correspondingly latent-score queries,
+which is an honest reading of the data the College Board reports
+(they too truncate at 1600). For the highest-mean group (Asian,
+approximately 26% of mass in the top reported band) the unrealizable
+latent mass above 1600 is non-trivial; we treat within-top-band
+shape as unidentified by the band data alone and revisit the
+practical consequence in Composition of the High-Scoring Pool.
+
+Of the four parameters, only the scale is given time structure. The
+published cohort SD rose from approximately 204 to 235 across
+2018--2025 as the SAT-taking population broadened post-SAT-optional;
+a model with fixed per-group scales would sit at the all-years
+average and be too narrow in recent cohorts. For each of the seven
+*named* groups we let
+
+$$
+\sigma_{r,y} \;=\; \sigma_r \exp\!\bigl(\lambda_r z_y + \eta_{r,y}\bigr),
+$$ {#eq-scaletrend}
+
+with $\sigma_r$ the mid-period scale, $z_y$ the standardized year,
+$\lambda_r$ a per-group log-linear growth rate (pooled toward a
+common $\beta_\lambda$), and $\eta_{r,y}$ a per-cell residual around
+that trend (held close to zero by a tight prior, but a genuine free
+parameter so the cohort statistics inherit its uncertainty rather
+than treating the parametric form as exact). The fitted
+$\beta_\lambda \approx 0.03$ corresponds to scales about 10% wider in
+2025 than in 2018.
+
+The eighth group, "No response", receives a free per-year log scale
+instead of the log-linear trend, for the empirical reasons given in
+Data: its band-midpoint SD follows a step pattern across 2018–2025
+that
+a smooth trend cannot track, and forcing it into the named-group
+hierarchy distorts that hierarchy.
+
+The per-group-year location is a free parameter $\mu_{r,y}$. The
+published group mean $\bar S^{\text{pub}}_{r,y}$ is not used in the fit.
+It and the band percentages come from the same test-takers, so treating
+the mean as a separate exact fact would double-count. Holding it out
+also turns "the model recovers the published group means from the band
+percentages alone" into a check comparable to those on the cohort SD
+and quartiles.
+
+The "Two or More Races" group is fit with the same single-(skewness,
+tail-weight) SHASH as each named single-race group.^[The group is
+structurally a mixture of distinct ancestral populations, but a
+richer mixture density for this one group would not be identified by
+six band totals per cell, and the empirical residuals (see
+@fig-ppc-resid) do not visibly require it.]
+
+## A Dirichlet Likelihood on Band Proportions {#sec-likelihood}
+
+For each group and year, let
+$\hat p_{r,y,\bullet} = (\hat p_{r,y,1}, \dots, \hat p_{r,y,6})$ be
+the six band proportions for that imputation (each in $[0, 1]$,
+summing to one by construction of the imputation procedure in Data).
+We model the *observed proportions directly*, with no reconstructed
+counts:
+
+$$
+\hat p_{r,y,\bullet} \;\sim\; \text{Dirichlet}\!\left(\phi_r\,\pi_{r,y,\bullet}\right),
+$$ {#eq-dirichlet}
+
+where $\pi_{r,y,\bullet}$ are the SHASH band probabilities of
+@eq-bandprob and $\phi_r > 0$ is a per-group concentration parameter,
+pooled hierarchically across groups (see *Hierarchical Structure*
+below). The Dirichlet has mean $\pi_{r,y,\bullet}$ and component
+variances $\pi_{r,y,b}(1 - \pi_{r,y,b})/(\phi_r + 1)$, which do not
+depend on $N_{r,y}$. A small group is therefore not treated as orders
+of magnitude noisier than a large one. The precision of every
+reported proportion is governed by the per-group concentration,
+fit from the data.
+
+The group-size-invariance the Dirichlet provides addresses a mismatch
+in the data. The published band percentages are *coarsened* in the
+grouped-data sense of @heitjan1989 and the coarsened-data sense of
+@heitjanrubin1991 and @heitjan1994, with
+rounding to the nearest integer percentage point ($\pm 0.5$ percentage
+points by construction). Related parametric and imputation-based
+treatments of similarly coarsened or heaped data appear in
+@wangheitjan2008. A multinomial likelihood on reconstructed counts would tighten the
+largest group's band-proportion standard errors by a factor of about
+$\sqrt{N_\text{max}/N_\text{min}} \approx 16$ relative to the smallest's,
+even though the actual measurement noise --- integer rounding to the
+nearest percentage point --- is the same in percentage points across
+all groups; empirically, that specification gives only about 13%
+coverage of nominal-90% predictive intervals. The Dirichlet decouples
+dispersion from $N$ and leaves the per-group concentration to absorb
+the within-group residual misfit.
+
+Rounding noise is handled outside the Dirichlet by *multiple imputation*
+[@rubin1987mi], using the rejection-sampling procedure described in
+Data: each named-group row is drawn uniformly from the rounding-box-intersected
+simplex, and No response is derived by subtraction from the exact
+published cohort band counts. The full SHASH+Dirichlet model is fit to
+each of $M = 50$ such imputed datasets and the resulting posterior
+draws are pooled. Printed zeros require no separate treatment because
+the rounding interval $[0, 0.5)$ is sampled natively.
+
+Within a group, a single concentration forces the dispersion of the
+wide central bands and the narrow tail bands to be governed by one
+number, where in fact the rounding noise is constant in percentage
+points and the Dirichlet variance scales with $\pi(1-\pi)$. A
+per-band $\phi_{r,b}$ orthogonal to the per-group pooling would be
+more faithful. We do not
+pursue it here, and the resulting over-coverage in the tail bands is
+documented in the posterior predictive check below.
+
+## Hierarchical Structure {#sec-hierarchy}
+
+For the seven named groups, all six per-group parameters are pooled hierarchically across
+groups on the same pattern (each on a Gaussian centered at a
+cross-group mean), so that the smallest groups (Native Hawaiian/Other
+Pacific Islander, American Indian/Alaska Native) shrink toward the
+cross-group average rather than tracking their own sampling noise.
+This applies small-area estimation [@fayherriot1979;
+@pfeffermann2013; @raomolina2015] at the group level. The three parameters whose natural scale is unconstrained
+(the log-scale, the skewness, and the log-scale growth rate) are
+pooled directly:
+
+$$
+\log\sigma_r \sim \mathcal{N}(\beta_\sigma, \tau_\sigma), \qquad
+\epsilon_r \sim \mathcal{N}(\beta_\epsilon, \tau_\epsilon), \qquad
+\lambda_r \sim \mathcal{N}(\beta_\lambda, \tau_\lambda).
+$$ {#eq-hier}
+
+The three positive parameters (the tail-weight, the Dirichlet
+concentration, and the scale-residual SD) are pooled on the log
+scale:
+
+$$
+\log\delta_r \sim \mathcal{N}(\beta_\delta, \tau_\delta), \qquad
+\log\phi_r   \sim \mathcal{N}(\beta_\phi,   \tau_\phi),   \qquad
+\log\tau_{\eta,r} \sim \mathcal{N}(\beta_{\tau_\eta}, \tau_{\tau_\eta}).
+$$ {#eq-hier-extra}
+
+The per-group tail-weights are *a priori* the parameters most exposed
+to the within-band identifiability concern, since the within-band
+shape of the top band (1400–1600) they govern is exactly what six
+band totals cannot directly recover (see Discussion). In the fitted
+model, the per-group tail-weight posterior medians span a narrow
+range of about 0.02, all sitting just above one. The
+per-group-year scale residuals themselves are
+$\eta_{r,y} \sim \mathcal{N}(0, \tau_{\eta,r})$, year-level
+departures from the log-linear scale trend rather than additional
+structure. The "No
+response" group's scale is unpooled, as described above. Its skewness
+$\epsilon_{\text{NR}}$, tail-weight $\delta_{\text{NR}}$, and
+concentration $\phi_{\text{NR}}$ remain in the hierarchies of
+@eq-hier and @eq-hier-extra.
+
+## Priors and Estimation {#sec-estimation}
+
+The model's hyperparameters fall into three groups. The named-group
+hierarchies on the within-group scale, skewness, and scale-growth rate
+take weakly informative settings, with a Gaussian prior on each mean
+and a half-normal prior on each spread:
+
+$$
+\begin{aligned}
+\beta_\sigma     &\sim \mathcal{N}(\log 230,\, 0.4),  &\quad
+\tau_\sigma      &\sim \mathcal{N}^{+}(0,\, 0.35), \\
+\beta_\epsilon   &\sim \mathcal{N}(0,\, 0.6),         &\quad
+\tau_\epsilon    &\sim \mathcal{N}^{+}(0,\, 0.8),  \\
+\beta_\lambda      &\sim \mathcal{N}(0,\, 0.15),        &\quad
+\tau_\lambda     &\sim \mathcal{N}^{+}(0,\, 0.06).
+\end{aligned}
+$$ {#eq-priors-core}
+
+The hierarchies on the tail-weight, Dirichlet concentration, and
+per-group scale-residual SD are likewise weakly informative, with the
+$\beta_\delta$ and $\tau_\delta$ settings centering each $\delta_r$
+near $1$:
+
+$$
+\begin{aligned}
+\beta_\delta       &\sim \mathcal{N}(0,\, 0.3),           &\quad
+\tau_\delta        &\sim \mathcal{N}^{+}(0,\, 0.2),  \\
+\beta_\phi         &\sim \mathcal{N}(\log 300,\, 1.5),    &\quad
+\tau_\phi          &\sim \mathcal{N}^{+}(0,\, 0.5),  \\
+\beta_{\tau_\eta}  &\sim \mathcal{N}(\log 0.03,\, 0.6),   &\quad
+\tau_{\tau_\eta}   &\sim \mathcal{N}^{+}(0,\, 0.3).
+\end{aligned}
+$$ {#eq-priors-aux}
+
+The per-cell SHASH location $\mu_{r,y}$ is parameterized in terms of
+the cell's *expected score* $\theta_{r,y} = \mathbb{E}[S_{r,y}]$,
+which is given the prior $\theta_{r,y} \sim \mathcal{N}(1050, 300)$.
+This is the *centered parameterization* of the skew-normal literature
+[@azzalini1985; @azzalini2014], which removes a near-singularity in
+the likelihood, applied here to the sinh-arcsinh family
+[@jonespewsey2009]. The induced raw SHASH location is
+$\mu_{r,y} = \theta_{r,y} - \sigma_{r,y}\,m(\epsilon_r, \delta_r)$,
+with $m(\epsilon, \delta) = \mathbb{E}[X]$ computed by 24-node
+Gauss–Hermite quadrature once per group per draw. The per-cell prior
+mean $1050$ is the rough overall SAT mean and the spread $300$ is
+wide enough to be essentially flat over the range of plausible group
+means. Its only role is to keep the noisiest small group's expected
+score from drifting to implausible values. In the fitted model the
+posterior median per-cell expected score $\theta_{r,y}$ runs from
+approximately 873 to 1248 across the eight groups and eight years
+(within 0.7 prior standard deviations of the prior mean even for the
+smallest groups), so the prior is essentially flat over the realized
+support and does not propagate meaningfully into the posterior. For the No response group's free
+per-year log scale we take
+$\log\sigma_{\text{NR},y} \sim \mathcal{N}(\log 230, 0.4)$,
+independent across years. The group-level hierarchy is in the
+non-centered parameterization throughout.
+
+The model is fit by Hamiltonian Monte Carlo as implemented in Stan
+[@carpenter2017stan; @betancourt2017hmc], via the cmdstanr
+interface [@cmdstanr2024] in R [@rcore2024]; posterior summaries and
+diagnostics use the *posterior* package [@burkner2025posterior], data
+manipulation uses *dplyr* [@wickham2023dplyr], and figures are
+produced with *ggplot2* [@wickham2016ggplot2]. The full SHASH+Dirichlet
+specification is fit independently to each of $M = 50$ imputed
+datasets (drawn as described in *A Dirichlet Likelihood on Band
+Proportions* above), with two chains, 1,000 warmup, and 1,000 retained
+iterations per fit at `adapt_delta` = 0.95, yielding 2,000
+draws per imputation and 100,000 pooled draws in total. We follow the workflow conventions of
+@gabryworkflow2019 and @kruschke2014.
+Convergence is assessed by the rank-normalized split-$\widehat R$
+[@vehtari2021rhat] and the effective sample size. Model fit is
+assessed by posterior predictive checks
+[@rubin1984bayesianly; @meng1994posterior; @gelman1996ppc; @gelman2013bda]
+and out-of-sample agreement with held-out summaries. We report 95%
+credible intervals for the substantive headline quantities (Black
+shares, the Asian-to-Black ratio, cohort summaries in the validation
+figures) and 90% credible intervals for the per-group parameters in
+the diagnostic tables, following common convention in each setting.
+All code and data are available (see the closing note).
+
+# Results
+
+## Fit and Identification
+
+```{r}
+#| label: diag-summary
+#| include: false
+# Per-imputation diagnostics aggregated by the MI driver
+max_rhat   <- .mi_obj$max_rhat_across_imp
+min_bulk   <- .mi_obj$min_ess_bulk_across_imp
+min_tail   <- .mi_obj$min_ess_tail_across_imp
+n_div      <- .mi_obj$n_div
+n_imp      <- .mi_obj$M
+iters_per_imp <- nrow(.mi_obj$draws) / n_imp     # ~1,200 (2 chains x 600 samples)
+total_iters   <- nrow(.mi_obj$draws)
+```
+
+Per-imputation convergence diagnostics are in @tbl-diag. Raising
+the HMC adaptation target to `adapt_delta` = 0.95 from the
+cmdstanr default of 0.8 cut the divergence count across the 50
+imputations from a few hundred to around a dozen — well under 0.1% of
+pooled iterations — without materially shifting the headline. The
+worst-case $\widehat R$ and ESS [@vehtari2021rhat] across all 50
+imputations sit slightly outside the conventional thresholds, with
+the affected parameters concentrated at the top of the hierarchy
+(the cross-group hyperparameter means) and in the No response
+group. The per-cell quantities that bear on the headline
+($\mu_{r,y}$, $\sigma_{r,y}$ for the named groups) have ESS bulk in
+the low thousands and $\widehat R$ at most 1.01. We treat the
+pooled posterior as well-resolved.
+
+```{r}
+#| label: tbl-diag
+#| echo: false
+#| tbl-cap: "**Convergence Diagnostics across Imputations.** Aggregated across the M = 50 imputations. Maximum rank-normalized split-$\\widehat R$ and minimum effective sample sizes are taken over per-imputation values; divergent transitions are summed."
+data.frame(
+  Diagnostic = c("Maximum rank-normalized split-$\\widehat R$ across imputations",
+                 "Minimum bulk effective sample size across imputations",
+                 "Minimum tail effective sample size across imputations",
+                 sprintf("Divergent transitions (of %s pooled iterations)",
+                         format(total_iters, big.mark = ","))),
+  Value = c(sprintf("%.3f", max_rhat),
+            format(round(min_bulk), big.mark = ","),
+            format(round(min_tail), big.mark = ","),
+            format(n_div, big.mark = ",")),
+  check.names = FALSE
+) |> kable(align = c("l", "r"))
+```
+
+@tbl-diag-shape gives per-parameter diagnostics for the cross-group
+hyperparameter means and for the per-group tail-weights $\delta_r$
+and skewnesses $\epsilon_r$. Across all 50 imputations the
+per-group $\delta_r$ and $\epsilon_r$ have $\widehat R$ at most
+around 1.01 and bulk ESS comfortably in the hundreds. The
+cross-group hyperparameter means mix slowest, with the worst-case
+$\widehat R$ values sitting just above 1.01 and bulk ESS in the low
+hundreds in the worst-mixing imputations; that slow mixing at the
+top of the hierarchy does not propagate to the per-group skewnesses
+and tail-weights underneath, the parameters that carry the
+substantive between-group separation.
+
+```{r}
+#| label: tbl-diag-shape
+#| echo: false
+#| tbl-cap: "**Per-Parameter Convergence Diagnostics.** Top-of-hierarchy hyperparameter means, plus the per-group skewnesses $\\epsilon_r$ and tail-weights $\\delta_r$. The remaining hierarchy parameters ($\\beta_\\sigma$ and all hierarchy spreads $\\tau_\\bullet$) are well-resolved in every imputation and are captured by the aggregate maximum $\\widehat R$ in @tbl-diag. Reported values are the worst case (maximum $\\widehat R$, minimum bulk ESS, minimum tail ESS) across the 50 imputations."
+ROW_LBL <- c(
+  beta_eps_mean     = "$\\beta_\\epsilon$",
+  beta_log_delta    = "$\\beta_\\delta$",
+  beta_log_phi      = "$\\beta_\\phi$",
+  beta_log_tau_eta  = "$\\beta_{\\tau_\\eta}$",
+  lambda_mean       = "$\\beta_\\lambda$")
+for (r in seq_along(RACES))
+  ROW_LBL[sprintf("epsilon[%d]", r)] <- sprintf("$\\epsilon_{\\text{%s}}$", RACE_LABEL[r])
+for (r in seq_along(RACES))
+  ROW_LBL[sprintf("delta[%d]", r)]   <- sprintf("$\\delta_{\\text{%s}}$", RACE_LABEL[r])
+ROW_ORDER <- names(ROW_LBL)
+pd <- .mi_obj$per_param_diag
+pd <- pd[match(ROW_ORDER, pd$variable), ]
+# Drop any rows for parameters that weren't in run_fit_mi.R's keep list
+# (their diagnostics weren't saved); the table then auto-tracks the
+# keep list, so adding parameters to keep just makes them appear here
+# on the next refit.
+keep_rows <- !is.na(pd$variable)
+ROW_ORDER <- ROW_ORDER[keep_rows]
+pd        <- pd[keep_rows, ]
+data.frame(
+  Parameter      = ROW_LBL[ROW_ORDER],
+  `$\\widehat R$` = sprintf("%.3f", pd$rhat),
+  `Bulk ESS`     = format(round(pd$ess_bulk), big.mark = ","),
+  `Tail ESS`     = format(round(pd$ess_tail), big.mark = ","),
+  check.names = FALSE,
+  row.names = NULL
+) |> kable(align = c("l", "r", "r", "r"), row.names = FALSE)
+```
+
+```{r}
+#| include: false
+# Coarse summary values used in the prose below.  The model
+# parameters themselves are in @tbl-params with full precision; the
+# prose uses round numbers so that small fit-to-fit drift in the
+# underlying medians does not move the rendered text.
+.lambda_growth_pct <- 100 * (exp(diff(range(as.numeric(scale(YEARS)))) *
+                                 DRAWS$summary("lambda_mean")$median) - 1)
+scale_growth_pct_5 <- sprintf("%d", 5 * round(.lambda_growth_pct / 5))
+.phi_med           <- median(DRAWS$summary("phi")$median)
+band_scatter_pp    <- sprintf("%.0f", 100 * sqrt(0.2 * 0.8 / .phi_med))
+```
+
+The common scale-trend rate posterior median is small and positive,
+implying a scale roughly `r scale_growth_pct_5`% wider in 2025 than
+in 2018, with the per-group rates in a narrow band around it and the
+per-cell residuals small (per-group scale-residual SDs on the order
+of one percent of the cell scale). The per-group Dirichlet
+concentrations imply a band-proportion scatter of about
+`r band_scatter_pp` percentage points. With rounding noise handled
+upstream by the imputation layer, this residual scatter is the
+year-to-year shape drift the year-constant skewness and tail-weight
+cannot absorb.
+
+@tbl-params gives the per-group parameters. Scales span
+approximately 188--276 across the seven named groups. The per-group
+tail-weights all sit just above one, so the tails are nearly
+Gaussian for every group. What
+separates the groups is the skewness: small but positive for White
+(about 0.06), slightly negative for Asian (concentrated near the
+1600 ceiling, with a left-trailing tail), and approximately 0.4--0.5
+for the lower-mean groups (a dense lower bulk with a thin tail of
+high scorers). The scale-growth rates are all small and similar. The differences in *shape* across groups
+are therefore modest. The large disparities in the *composition* of
+the high-scoring pool seen below are not the product of any group
+having an exotic distribution, but the ordinary tail-divergence
+consequence of the differences in means, which the model recovers
+from the band data alone (the published means play no part).
+
+```{r}
+#| label: tbl-params
+#| echo: false
+#| tbl-cap: "**Per-Group Posterior Parameters for the Seven Named Groups.** Each cell shows the posterior median with the 90% credible interval in brackets. $\\sigma_r$ is the mid-period scale; $\\epsilon_r$ the (year-constant) skewness; $\\delta_r$ the (year-constant) tail-weight; $\\lambda_r$ the scale-growth rate, with $\\sigma_{r,y} = \\sigma_r\\exp(\\lambda_r z_y + \\eta_{r,y})$. The No response group is in the same skewness, tail-weight, and concentration hierarchies as the named groups (with $\\delta_{\\text{NR}} \\approx 1.13$, comparable to the named-group range), but its scale is free per year rather than parameterized by a $(\\sigma_r, \\lambda_r)$ pair (see Methods) and so it is not shown here."
+gp <- function(par) {
+  s <- DRAWS$summary(par)
+  s$ri <- as.integer(sub(paste0("^", par, "\\[(\\d+)\\]$"), "\\1", s$variable))
+  s |> arrange(ri)
+}
+slg <- gp("sigma_log0"); eps <- gp("epsilon"); del <- gp("delta"); lam <- gp("lambda")
+nri  <- match("No Response", RACES)
+named <- setdiff(seq_along(RACES), nri)
+# Avoid negative-zero printing on rounded epsilon ('-0.00') by normalising.
+fmt2 <- function(x) sub("^-0\\.00$", "0.00", sprintf("%.2f", x + 0))
+fmt3 <- function(x) sprintf("%.3f", x)
+cell_int  <- function(med, lo, hi) sprintf("%d [%d, %d]", round(med), round(lo), round(hi))
+cell_fmt2 <- function(med, lo, hi) sprintf("%s [%s, %s]", fmt2(med), fmt2(lo), fmt2(hi))
+cell_fmt3 <- function(med, lo, hi) sprintf("%s [%s, %s]", fmt3(med), fmt3(lo), fmt3(hi))
+out <- data.frame(
+  Group               = RACE_LABEL[named],
+  `$\\sigma_r$`       = cell_int (exp(slg$median[named]), exp(slg$q5[named]), exp(slg$q95[named])),
+  `$\\epsilon_r$`     = cell_fmt2(eps$median[named],     eps$q5[named],     eps$q95[named]),
+  `$\\delta_r$`       = cell_fmt3(del$median[named],     del$q5[named],     del$q95[named]),
+  `$\\lambda_r$`      = cell_fmt3(lam$median[named],     lam$q5[named],     lam$q95[named]),
+  check.names = FALSE, row.names = NULL)
+kable(out, align = c("l", "r", "r", "r", "r"), row.names = FALSE)
+```
+
+```{r}
+#| label: draw-mats
+#| include: false
+# Plain numeric matrices (not the draws-matrix class) used by the
+# cohort-summary and SAT User Percentile validation chunks below.
+plain_mat <- function(v) { m <- DRAWS$draws(v, format = "matrix")
+  matrix(as.numeric(m), nrow = nrow(m), dimnames = list(NULL, colnames(m))) }
+sigry_d  <- plain_mat("sigma_ry")
+eps_d    <- plain_mat("epsilon")
+mu_d     <- plain_mat("mu")
+thmean_d <- plain_mat("theta_mean")
+del_d    <- plain_mat("delta")
+nit      <- nrow(sigry_d); set.seed(20260511); keep <- sample.int(nit, 300)
+sr       <- function(r, y) sprintf("sigma_ry[%d,%d]", r, y)
+```
+
+## Posterior Predictive Check
+
+If the model is calibrated, about 90% of the observed band proportions
+should lie inside their 90% posterior-predictive intervals. Drawing
+replicate proportions $\tilde p_{r,y,\bullet} \sim \text{Dirichlet}(\phi\,\pi_{r,y,\bullet})$
+for each of the $8 \times 8 \times 6 = 384$ cells:
+
+```{r}
+#| label: ppc-setup
+#| include: false
+prep <- DRAWS$summary("p_rep", ~ quantile2(.x, c(0.05, 0.5, 0.95))) |>
+  mutate(idx = sub("p_rep\\[", "", variable), idx = sub("\\]", "", idx)) |>
+  separate(idx, into = c("ri", "yi", "bi2"), sep = ",", convert = TRUE)
+BAND_HYPHEN <- c("400-590", "600-790", "800-990", "1000-1190", "1200-1390", "1400-1600")
+prep <- prep |>
+  mutate(obs     = P_OBS[cbind(ri, yi, bi2)],
+         in_ci   = obs >= q5 & obs <= q95,
+         sd_post = (q95 - q5) / (2 * 1.645),
+         z       = (obs - q50) / pmax(sd_post, 1e-9),
+         group   = factor(RACE_LABEL[ri], levels = RACE_LABEL),
+         year    = YEARS[yi],
+         band    = factor(BAND_HYPHEN[bi2], levels = BAND_HYPHEN))
+```
+
+The aggregate coverage of the 384 cells is close to the nominal 90%.
+The standardized residuals (observed minus predictive median, over
+predictive SD) are centered, with spread noticeably below one — the
+Dirichlet predictive intervals are *wider* than the actual residuals
+warrant in many cells, particularly in the upper bands (the
+1400--1600 band's z-SD $\approx 0.4$). A single per-group
+concentration cannot match both the wide central bands and the
+narrow tail bands at once, and the model errs toward the wide side;
+a per-band concentration would tighten the tail-band intervals.
+
+The cohort *aggregate* of the fitted band proportions agrees with
+the cohort aggregate of the observed ones to within a couple of
+percentage points everywhere, ruling out a bias *shared* across
+groups within a year that the cell-by-cell check could miss.
+@fig-ppc-resid plots the standardized residual for every (group,
+year, band) cell. Most scatter around zero with spread noticeably
+below one, consistent with the over-coverage just noted.
+
+Most of the named-group breaches concentrate in the 2025 cohort: a
+positive (under-predicted) cluster in the lowest band (400--590) for
+the lower-mean groups, where the model under-predicts the observed
+mass by about a percentage point, and a negative (over-predicted)
+cluster in the adjacent 600--790 band for the same broad set, where
+the model over-predicts by a comparable amount. Both patterns are
+consistent with a recent-cohort shift of mass leftward in those
+groups that the year-constant skewness cannot accommodate.
+
+The No response breaches are all in the lowest band (400--590) and
+include the figure's two largest residuals, both in the earlier
+cohorts (2018--2019), where the observed mass sits well above what a
+smooth SHASH curve fitted to the rest of that group's band
+proportions will accept. The remaining No response residuals sit
+closer to the named-group spread but are still slightly noisier,
+consistent with the empirical volatility of the raw No response
+numbers, which is also why that group is given its own free per-year
+scale.
+
+```{r}
+#| label: fig-ppc-resid
+#| echo: false
+#| fig-cap: "**Standardized Posterior-Predictive Residuals by Group and Band.** Each point is one (group, year, band) cell. Dashed lines mark $\\pm 1.645$, the Gaussian 90% reference under a calibrated model; the asymmetric Dirichlet 90% predictive intervals reported as the coverage statistic in the text are not identical to this Gaussian cut, so the count of points outside the dashed lines need not equal the cell count outside the coverage intervals. Color encodes the score band."
+#| fig-width: 8.5
+#| fig-height: 4.5
+ggplot(prep, aes(group, z, color = band)) +
+  geom_hline(yintercept = c(-1.645, 1.645), linetype = "dashed", color = "grey55") +
+  geom_hline(yintercept = 0, color = "grey25") +
+  geom_point(position = position_jitter(width = 0.2, height = 0,
+                                        seed = 20260524),
+             alpha = 0.8, size = 1.4) +
+  scale_color_viridis_d(name = NULL) +
+  labs(x = NULL, y = "standardized residual") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+
+## Validation {#sec-validation}
+
+Each annual report prints, alongside the band breakdown the model is
+fit to, five further cohort numbers: the Total-score mean, the
+standard deviation, and the 25th, 50th, and 75th percentile scores.
+None of these enters the model. The five differ in the strength of
+the check they provide. The cohort mean is a weighted moment of the
+same band proportions the model fits, so any model that matches the
+band proportions well will recover the cohort mean close to
+mechanically (up to a skewness correction inside each top band); its
+posterior is identified essentially by the band proportions, and a
+small recovery error is a basic consistency check rather than a
+predictive test. The cohort SD is somewhat freer: the per-group
+log-linear scale trend and the per-cell scale residuals give the
+model flexibility to fit the cohort SD to within a few score points
+without that fit being mechanically pinned by the bands. The
+*quartiles*, by contrast, are a genuine out-of-sample test of the
+shape in the body of the distribution: the bands constrain the
+cumulative distribution at the five interior cut points (595, 795,
+995, 1195, 1395), and where those cut points fall relative to the
+published $p_{25}$, $p_{50}$, $p_{75}$ depends on the parametric form
+between them. Across 2018–2025 that is $5 \times 8 = 40$ cohort
+numbers, of which the 24 quartile cells are the operative
+out-of-sample evidence.
+
+The mean and SD are compared in score points (@fig-cohort-mean-sd).
+Reported quartile *scores* live on the 10-point grid, so we compare
+in the dual direction: the model's posterior rank of each published
+quartile, which varies smoothly and should equal the nominal 0.25,
+0.50, or 0.75 (@fig-cohort-quartile-ranks).
+
+```{r}
+#| label: cohort-stats-compute
+#| include: false
+muf <- function(r, y) sprintf("mu[%d,%d]", r, y)
+tmf <- function(r, y) sprintf("theta_mean[%d,%d]", r, y)
+pub_wide <- read.csv("../replicated/data/moments/cohort.csv") |> filter(year %in% YEARS)
+cohort_stats <- map_dfr(seq_along(YEARS), function(yi) {
+  w  <- SD$N[, yi] / sum(SD$N[, yi])
+  pq <- pub_wide[pub_wide$year == YEARS[yi], ]
+  k25 <- match(pq$p25, GRIDX); k50 <- match(pq$p50, GRIDX); k75 <- match(pq$p75, GRIDX)
+  map_dfr(keep, function(it) {
+    cm  <- sum(w * thmean_d[it, tmf(seq_along(RACES), yi)])
+    Fhi <- sapply(seq_along(RACES), function(r)
+             shash_F((GRIDE - mu_d[it, muf(r, yi)]) / sigry_d[it, sr(r, yi)], eps_d[it, r], del_d[it, r]))
+    pr  <- rbind(Fhi[1, , drop = FALSE], diff(Fhi))
+    pg  <- as.numeric(pr %*% w); pg <- pg / sum(pg); m <- sum(GRIDX * pg); cdf <- cumsum(pg)
+    tibble(year = YEARS[yi],
+           stat = factor(c("mean", "SD", "p25", "p50", "p75"),
+                         levels = c("mean", "SD", "p25", "p50", "p75")),
+           kind = c("score", "score", "rank", "rank", "rank"),
+           value = c(cm, sqrt(sum((GRIDX - m)^2 * pg)), cdf[k25], cdf[k50], cdf[k75]))
+  })
+})
+cohort_band <- cohort_stats |> group_by(year, stat, kind) |>
+  summarize(q025 = quantile(value, .025), q50 = median(value), q975 = quantile(value, .975), .groups = "drop")
+pub_pts <- bind_rows(
+  pub_wide |> transmute(year, stat = "mean", kind = "score", ref = mean),
+  pub_wide |> transmute(year, stat = "SD",   kind = "score", ref = sd),
+  pub_wide |> transmute(year, stat = "p25",  kind = "rank",  ref = 0.25),
+  pub_wide |> transmute(year, stat = "p50",  kind = "rank",  ref = 0.50),
+  pub_wide |> transmute(year, stat = "p75",  kind = "rank",  ref = 0.75)) |>
+  mutate(stat = factor(stat, levels = c("mean", "SD", "p25", "p50", "p75")))
+```
+
+The mean is the result that matters most. Locating each curve from
+the bands alone, the model's recovered cohort mean is within a few
+points of the published value every year, and per group as well.
+Across the 56 named-group cells the recovered mean is within a point
+or two of the published one at the median, and the published value
+lies inside the model's 95% interval in nearly all of them. Only the
+No response group falls clearly outside the interval, by tens of
+points in some years: its mean is exactly derivable from the cohort
+and named-group means by subtraction, but the band-proportion fit is
+looser because of the empirical volatility shown in @fig-data-trends. The SD rises
+from approximately 209 in 2018 to approximately 239 in 2025,
+running about 4--5 points above the published rise from approximately
+204 to 235 throughout. The small per-cell residual lets it track
+the year-to-year fluctuations but not entirely (2018 and 2022 sit
+just outside the posterior). These are the two years where the
+published cohort SD departs furthest from a smooth trend: 2018 sits
+about 6 points below the trajectory the later years define (a
+plausible reading is an early-redesign test-taker cohort not yet
+settled to its later composition, but the public record does not
+document a specific cause), and 2022 fell by one point against an
+otherwise monotone rise (the class of 2022 was the first to have
+been through its junior-year SAT window with the standardized-test
+requirement eliminated at almost all colleges, leaving a more
+selectively self-chosen cohort). The model's per-group log-linear
+scale trend with a tight residual cannot reproduce departures of
+either size. The quartiles sit close to the nominal line: the
+median within about a percentage point in most years (with $+1.5$
+pp deviations in 2018 and 2019), $p_{25}$ within about a percentage
+point in most years (rising to $+2.5$ pp in 2018), and $p_{75}$
+within about a percentage point but running slightly *high* in
+2024--2025 (the same recent-cohort right-skew residual). Overall, the
+target lies inside the model's 95% interval in roughly nine of every
+ten of the 40 cells, with the bulk of the misses in the SD and
+quartile checks rather than the means. The misses themselves are
+small and mostly at the interval's edge. The 24
+quartile-rank checks, which exercise the shape of the cohort
+distribution at three interior points that the band proportions
+constrain only through the parametric form, are the operative
+out-of-sample validation. The cohort mean check is a near-mechanical
+consistency check of the same fit; the SD check is somewhat freer
+(the within-group variances depend on the SHASH shape the model
+estimates), but in practice the bands constrain it tightly enough
+that it tracks the published cohort SD to within a few points.
+
+```{r}
+#| label: fig-cohort-mean-sd
+#| echo: false
+#| fig-cap: "**Held-Out Cross-Check of the Cohort Mean and Standard Deviation.** By graduating-class year. Neither summary was used in fitting: the model was fit only to the six per-(race, year) banded percentages, and the implied cohort mean and SD are then computed as population-weighted moments of the fitted per-group score distributions. Blue line: posterior median of the model's implied cohort value; shaded band: 95% credible interval. Black points: the College Board's published cohort value. Y-axes differ between panels."
+#| fig-width: 7
+#| fig-height: 3.4
+cb_s <- filter(cohort_band, kind == "score")
+pp_s <- filter(pub_pts,     kind == "score")
+ggplot() +
+  geom_ribbon(data = cb_s, aes(year, ymin = q025, ymax = q975), fill = "#2c7fb8", alpha = 0.2) +
+  geom_line(  data = cb_s, aes(year, q50), color = "#2c7fb8", linewidth = 0.8) +
+  geom_point( data = pp_s, aes(year, ref), color = "grey10", size = 1.9) +
+  facet_wrap(~ stat, nrow = 1, scales = "free_y",
+             labeller = as_labeller(c(mean = "Mean", SD = "SD"))) +
+  scale_x_continuous(breaks = YEARS, labels = function(b) substr(as.character(b), 3, 4)) +
+  labs(x = "Graduating-class year ('18–'25)", y = "Score points")
+```
+
+```{r}
+#| label: fig-cohort-quartile-ranks
+#| echo: false
+#| fig-cap: "**Held-Out Cross-Check of the Published Cohort Quartile Scores.** By graduating-class year. For each year the College Board reports the score at the cohort's 25th, 50th, and 75th percentile. We plug each of those three reported scores into the model's posterior cumulative distribution to get the percentile the model itself assigns to that score (the model's 'implied rank'). A perfectly calibrated model places the published 25th-percentile score at percentile 25, the median score at 50, and the 75th-percentile score at 75. The vertical axis shows the model's implied rank minus the nominal value; zero (dashed) is perfect agreement, identical across panels so the three checks line up visually. Blue line: posterior median; shaded band: 95% credible interval. None of the three published quartiles was used in fitting."
+#| fig-width: 7
+#| fig-height: 3.4
+TARG <- c(p25 = 25, p50 = 50, p75 = 75)
+LBL  <- c(p25 = "25th percentile", p50 = "50th percentile", p75 = "75th percentile")
+cb_q <- filter(cohort_band, kind == "rank") |>
+  mutate(target   = TARG[as.character(stat)],
+         dev_q50  = 100 * q50  - target,
+         dev_q025 = 100 * q025 - target,
+         dev_q975 = 100 * q975 - target,
+         stat_lab = factor(LBL[as.character(stat)], levels = LBL))
+ggplot(cb_q) +
+  geom_ribbon(aes(year, ymin = dev_q025, ymax = dev_q975), fill = "#2c7fb8", alpha = 0.2) +
+  geom_line(  aes(year, dev_q50), color = "#2c7fb8", linewidth = 0.8) +
+  geom_hline( yintercept = 0, linetype = "dashed", color = "grey25") +
+  facet_wrap(~ stat_lab, nrow = 1) +
+  scale_x_continuous(breaks = YEARS, labels = function(b) substr(as.character(b), 3, 4)) +
+  labs(x = "Graduating-class year ('18–'25)",
+       y = "Model's implied rank minus nominal (pp)")
+```
+
+A second, finer check is independent of the band summaries entirely.
+The College Board publishes a *SAT User Percentile* table giving, in
+10-point steps, the cumulative share of test-takers scoring at or below
+each total score in the three most recently graduated cohorts pooled.
+The table is built from individual scores and is updated annually as
+new cohorts are added and old ones drop out. We hold it out of the fit
+and use it as an external check.
+
+The check has two distinct parts. Below the 1400 boundary, the
+comparison is primarily data-driven: the six observed band
+proportions pin the model's cohort survival curve at five
+band-boundary anchors, and any smooth distribution interpolating
+between those anchors will track the SAT User Percentile curve to within
+rounding noise. Above 1400, the comparison becomes distributional
+extrapolation: the band data give a single anchor at the lower
+boundary of the top band ($s = 1395$ in the latent-cut convention)
+and the model's SHASH form fills in the rest. The
+within-top-band shape (that is, what fraction of the 1400--1600
+band's mass sits above 1500 or 1550) is not identifiable from six
+band totals. The SAT User Percentile table is, in effect, that
+missing within-top-band shape information made public. The model's
+SHASH-based interpolation has no access to it during fitting;
+comparing the model's induced cohort percentiles against the
+reference is therefore the strictest external check the public
+record allows.
+
+The College Board publishes the SAT User Percentile table for five
+pooled-cohort windows: 2018–2020, 2019–2021, 2021–2023, 2022–2024,
+and 2023–2025 (the 2020–2022 window is not available). For the most
+recent window the model's implied cohort survival is computed by
+population-weighting the per-group SHASH survival functions over
+the contributing years and compared in @fig-validate against the
+published SAT User Percentile curve. The SAT User Percentile is reported
+as an integer at each 10-point grid score, so the true
+$P(\text{score}\ge t)$ lies in a one-percentage-point band (or a
+one-sided band of width 0.5 at the top scores reported as "99+");
+see the @fig-validate caption for details. The model's posterior
+median sits inside the SAT User Percentile rounding band at essentially every
+grid score through the headline threshold $t = 1500$: for 2023–2025
+the model puts 3.2% (95% CI 2.9%–3.7%) above 1500 and the
+SAT User Percentile band is $(2.5\%,\,3.5\%]$. The credible
+interval's upper edge (3.7%) extends about 0.2 percentage points
+above the band, so it is the median's position inside the band, not
+full interval containment, that constitutes the check here. The
+model drifts modestly
+above the SAT User Percentile band from $t = 1550$ upward — by about 0.5–1.0
+percentage points — before integer rounding at the top of the table
+forecloses further comparison. The corresponding plots for the four
+earlier windows show the same pattern and are not reproduced here.
+The downstream consequence is taken up in the Discussion.
+
+```{r}
+#| label: validate-compute
+#| include: false
+WINDOWS <- list(
+  "2018-2020" = c(2018, 2019, 2020),
+  "2019-2021" = c(2019, 2020, 2021),
+  "2021-2023" = c(2021, 2022, 2023),
+  "2022-2024" = c(2022, 2023, 2024),
+  "2023-2025" = c(2023, 2024, 2025))
+multi_validate <- purrr::map_dfr(names(WINDOWS), function(wname) {
+  years <- WINDOWS[[wname]]; yj <- match(years, YEARS)
+  N_w <- SD$N[, yj]; tot_N <- sum(N_w)
+  UP <- read.csv(sprintf("../replicated/data/percentiles/user_group_%s.csv", wname)) |>
+    mutate(emp = pmax(0, 1 - user_pct / 100))
+  # Rounding band for P(score >= t).  The College Board reports the
+  # User Percentile as an integer K under the "at or below" convention,
+  # except for the topmost scores where it reports "99+" (encoded in the
+  # CSV as 99.5).  An integer K at grid score t-10 means
+  # P(<=t-10)*100 in [K-0.5, K+0.5), so P(>=t) in
+  # (1 - (K+0.5)/100, 1 - (K-0.5)/100] -- a one-percentage-point band.
+  # A half-integer 99.5 at t-10 means P(<=t-10)*100 in [99.5, 100], so
+  # P(>=t) in [0, 0.5%] -- a half-percentage-point ONE-SIDED band.
+  ug_lookup <- setNames(UP$user_pct, as.character(UP$score))
+  is_half <- function(x) abs(x - round(x)) > 0.25
+  UP <- UP |> dplyr::mutate(
+    pct_below = ug_lookup[as.character(score - 10)],
+    pct_below = ifelse(is.na(pct_below), 0, pct_below),
+    ug_lo = ifelse(is_half(pct_below),
+                   0,
+                   pmax(0, 1 - (pct_below + 0.5) / 100)),
+    ug_hi = ifelse(is_half(pct_below),
+                   pmin(1, 1 - (pct_below      ) / 100),
+                   pmin(1, 1 - (pct_below - 0.5) / 100)))
+  out <- purrr::map_dfr(UP$score, function(t) {
+    vals <- purrr::map_dbl(keep, function(it) {
+      tot <- 0
+      for (r in seq_along(RACES))
+        for (j in seq_along(yj)) {
+          yy <- yj[j]
+          tot <- tot + N_w[r, j] *
+            (1 - shash_F((t - mu_d[it, muf(r, yy)]) / sigry_d[it, sr(r, yy)],
+                         eps_d[it, r], del_d[it, r]))
+        }
+      tot / tot_N
+    })
+    tibble(score = t,
+           q50 = median(vals),
+           q5  = quantile(vals, 0.05),
+           q95 = quantile(vals, 0.95))
+  })
+  out |> dplyr::mutate(window = wname) |>
+    dplyr::inner_join(UP, by = "score")
+})
+# Median-inside-band coverage across all (window, grid score) cells:
+ppc_n_in_val <- sum(multi_validate$q50 >= multi_validate$ug_lo &
+                    multi_validate$q50 <= multi_validate$ug_hi)
+ppc_n_tot_val <- nrow(multi_validate)
+
+# Exact cohort P(score >= t) at every reported band lower-edge per
+# window, from the published band data.  These are five hard
+# data-pinned anchor points per window at scores 600, 800, 1000, 1200,
+# 1400 (the lower edge of each band after the first).  They carry no
+# integer-rounding uncertainty: the per-(race, year) band counts sum
+# to the published cohort band counts by construction of the
+# imputation.
+band_edge_scores <- c(600, 800, 1000, 1200, 1400)
+exact_anchors <- purrr::map_dfr(names(WINDOWS), function(wname) {
+  yj <- match(WINDOWS[[wname]], YEARS)
+  tot_N <- sum(SD$N[, yj])
+  band_p <- vapply(seq_len(6), function(b)
+    sum(sapply(yj, function(y) sum(SD$N[, y] * P_OBS[, y, b]))) / tot_N,
+    numeric(1))
+  cum_le_upper_edge <- cumsum(band_p)[1:5]
+  tibble(window = wname,
+         score  = band_edge_scores,
+         p      = 1 - cum_le_upper_edge)
+})
+```
+
+```{r}
+#| label: fig-validate
+#| echo: false
+#| fig-cap: "**External Held-Out Validation against the SAT User Percentile Reference, 2023--2025 Pooled Cohort.** Grey rectangles: the range of $P(\\text{score} \\ge t)$ consistent with the integer SAT User Percentile at $t-10$ --- a one-percentage-point band, or a one-sided $[0,\\,0.5\\%]$ band at the topmost scores reported as '99+'. Solid blue: modeled cohort $P(\\text{score} \\ge t)$, posterior median of the population-weighted survival across 2023--2025. Black points: exact cohort survival at each reported band lower-boundary (600, 800, 1000, 1200, 1400). Plots for the four earlier pooled-cohort windows look similar and are omitted."
+#| fig-width: 6.5
+#| fig-height: 4
+ggplot(dplyr::filter(multi_validate, window == "2023-2025"), aes(x = score)) +
+  geom_rect(aes(xmin = score - 5, xmax = score + 5, ymin = ug_lo, ymax = ug_hi),
+            fill = "grey30", color = "grey15", linewidth = 0.15, alpha = 0.55) +
+  geom_line(aes(y = q50), color = "#2c7fb8", linewidth = 0.7) +
+  geom_point(data = dplyr::filter(exact_anchors, window == "2023-2025"),
+             aes(x = score, y = p), color = "grey15", size = 1.8) +
+  scale_x_continuous(breaks = seq(400, 1600, by = 200)) +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  labs(x = "SAT total threshold", y = "P(score ≥ t)")
+```
+
+## Composition of the High-Scoring Pool
+
+```{r}
+#| label: snap-compute
+#| include: false
+# Posterior quantities for fig-snapshot AND the inline numbers in the
+# Applications prose below.  Defined here (before any prose refers to
+# it) so that every number in this section -- in the text, the figure,
+# and the caption -- pulls from the same posterior draws.
+THR <- c(1400, 1450, 1500, 1550)
+QLAB <- c(share = "Black share of above-threshold pool (%)", ratio = "Asian / Black ratio")
+n_above_1400 <- SD$N[, y25] * P_OBS[, y25, 6]
+snap <- map_dfr(THR, function(t) {
+  if (t == 1400) {
+    rr <- n_above_1400[ai] / n_above_1400[bi]
+    pb <- 100 * n_above_1400[bi] / sum(n_above_1400)
+    tibble(threshold = t, quantity = c("ratio", "share"),
+           q50 = c(rr, pb), q025 = NA_real_, q975 = NA_real_)
+  } else {
+    d <- DRAWS$draws(sprintf("p_above_%d", t), format = "draws_df")
+    counts <- sapply(seq_along(RACES), function(r) SD$N[r, y25] * d[[sprintf("p_above_%d[%d,%d]", t, r, y25)]])
+    rr <- counts[, ai] / counts[, bi]
+    pb <- 100 * counts[, bi] / rowSums(counts)
+    tibble(threshold = rep(t, 2), quantity = c("ratio", "share"),
+           q50  = c(median(rr), median(pb)),
+           q025 = c(quantile(rr, .025), quantile(pb, .025)),
+           q975 = c(quantile(rr, .975), quantile(pb, .975)))
+  }
+})
+# Inline helpers used by the prose below.  Round so the rendered text
+# reads like the figure (one decimal place for percentages, integer
+# for ratios).
+sg <- function(t, q, col = "q50") snap[snap$threshold == t & snap$quantity == q, col, drop = TRUE]
+r1400 <- round(sg(1400, "ratio"))
+p1400 <- round(sg(1400, "share"), 1)
+r1450 <- round(sg(1450, "ratio"))
+r1450_lo <- round(sg(1450, "ratio", "q025"))
+r1450_hi <- round(sg(1450, "ratio", "q975"))
+r1550 <- round(sg(1550, "ratio"))
+r1550_lo <- round(sg(1550, "ratio", "q025"))
+r1550_hi <- round(sg(1550, "ratio", "q975"))
+```
+
+@fig-snapshot shows the Black share and the Asian-to-Black ratio of
+test-takers scoring at or above four thresholds
+(1400, 1450, 1500, 1550) for the 2025 graduating class cohort. At
+the 1400 boundary the
+values follow directly from the College Board's published numbers (subject
+to their $\pm 0.5$ percentage-point integer rounding, which is
+non-trivial when the printed share is itself near $1\%$): Black
+students are approximately `r p1400`% of the above-1400 pool, with
+about `r r1400` Asian test-takers above 1400 per Black. The
+higher thresholds fall inside the top band, where the model
+interpolates. The credible intervals are wide (the 1450+ ratio is
+about `r r1450` with 95% CI roughly `r r1450_lo`–`r r1450_hi`, the
+1550+ ratio about `r r1550` with CI `r r1550_lo`–`r r1550_hi`). We
+stop at 1550 because the model's $P(\text{latent} \ge t)$ includes
+mass past the 1600 ceiling that no reported score can realize: the
+effect is small at moderate thresholds (the SAT User Percentile
+check passes at 1500), grows toward the ceiling, and dominates as
+$t$ approaches 1600. The medians trace the familiar tail-divergence
+pattern; the figure's substantive content is the width of the
+intervals, which would be tighter under any model that treated the
+rounded inputs as exact counts.
+
+```{r}
+#| label: fig-snapshot
+#| echo: false
+#| fig-cap: "**Principal Tail Quantities for the 2025 Graduating Class.** Left: Black share of all test-takers above each threshold. Right: Asian-to-Black ratio of test-takers at or above each threshold. At $t = 1400$ the values follow directly from the College Board's published numbers and are shown as point estimates without a credible interval, since the model is not used at this threshold; the only uncertainty is the $\\pm 0.5$ percentage-point integer-rounding noise on each per-race share in the 1400--1600 band, which is a deterministic bound (not a credible interval) and is discussed in the text. The three higher thresholds fall inside the top band where the model interpolates: points show posterior medians and bars show 95% credible intervals."
+#| fig-width: 7.5
+#| fig-height: 3.8
+snap$quantity <- factor(QLAB[snap$quantity], levels = QLAB)
+ggplot(snap, aes(x = threshold, y = q50)) +
+  geom_errorbar(aes(ymin = q025, ymax = q975), width = 14, linewidth = 0.6,
+                color = "#2c7fb8", na.rm = TRUE) +
+  geom_point(size = 2.1, color = "#2c7fb8") +
+  facet_wrap(~quantity, scales = "free_y") +
+  scale_x_continuous(breaks = THR) +
+  labs(x = "SAT total threshold", y = NULL)
+```
+
+# Discussion
+
+This paper presents a Bayesian hierarchical model that recovers a
+continuous per-group score distribution from coarsely banded summary
+data. We then apply it to the College Board's reports of SAT total
+scores for the graduating classes of 2018 through 2025, using the
+fitted distributions to answer composition and tail-quantity
+questions about the 2025 cohort. Four modeling choices
+underpin the result. A sinh-arcsinh shape gives separate skewness
+and tail-weight parameters with a closed-form CDF that evaluates in
+constant time inside the likelihood. A free per-cell location holds
+the published group mean out of the fit, which both avoids
+double-counting it as a separate fact about the same students and
+makes it a held-out quantity that the model has to recover. A
+Dirichlet likelihood on the observed proportions provides a
+group-size-invariant overdispersion that the per-group concentration
+parameter fits to the actual residuals, in contrast to the sampling
+noise assumed by a multinomial on reconstructed counts. And a
+partial-pooling hierarchy across groups stabilizes the skewness,
+tail-weight, and concentration parameters for the smaller cohorts
+(Native Hawaiian/Other Pacific Islander, American Indian/Alaska
+Native), which would otherwise be too imprecise to support per-group
+tail-quantity claims.
+
+The contribution is the model itself, in two respects. The
+sinh-arcsinh family [@jonespewsey2009] is well established in flexible
+distributional modeling, principally within the GAMLSS framework
+[@rigbystasinopoulos2005; @stasinopoulosrigby2007] for individual-level
+data; prior work has not, to our knowledge, applied it to coarsely
+banded score data with a Dirichlet likelihood whose group-size-invariant
+overdispersion accommodates the rounding step and the residual misfit
+of a parsimonious shape assumption. Separately, fitting a full parametric score distribution to each
+(group, year) cell of the College Board's publicly released banded
+summaries is, to our knowledge, new. Published work on group differences in SAT
+performance has either relied on access to individual scores
+[e.g. @sackettkuncelhezlett2009; @kuncelhezlett2010;
+@kobrinpatterson2011] or has stayed at the level of published
+moments and aggregate gap estimates [e.g. @roth2001ethnic;
+@hauser2002]. The methods literature on inferring
+score gaps from coarse public data [@reardon2011;
+@reardonkalogridesshores2019] uses multilevel structures to recover
+mean gaps with calibrated uncertainty from heaped or banded
+state-accountability test data, but has not paired a parametric
+within-group distribution with a group-size-invariant Dirichlet
+likelihood on the proportions themselves. The contribution here is
+complementary rather than competing: within-group *shape* on
+nationally aggregated SAT data, rather than between-group means on
+state-accountability data. The framework proposed here is therefore the
+first that allows a reader who has only the public banded reports to
+ask compositional and tail-quantity questions about each racial/ethnic
+group of SAT-takers separately, and to receive answers with calibrated
+uncertainty.
+
+The validation has two held-out surfaces. The five-number cohort
+moments — mean, SD, and three quartile scores — are reproduced to
+within a few score points (for the mean and SD) or about a
+percentage point in implied rank (for the three quartiles) in
+most years. The fine-grained SAT User Percentile reference
+is tracked closely through the 1500 threshold, with a mild residual
+at 1550. The 24 quartile cells are the genuine out-of-sample test
+passed by the fit; the cohort mean is a near-mechanical consequence
+of fitting the band proportions, and the cohort SD a slightly looser
+corollary with some residual freedom in the within-group shape. 
+
+The model has real limitations. All credible intervals reported on
+tail quantities are conditional on the SHASH parametric form being
+correct. The SHASH form interpolates the
+within-1400--1600 shape that the band data cannot identify, and is
+checked against the held-out SAT User Percentile reference. The
+model agrees with the reference at $t = 1500$ and drifts modestly
+above it at $t = 1550$ (by 0.5--1.0 percentage points in recent
+windows). The cohort SD is missed in 2018 and 2022, and the
+posterior rank of the published $p_{75}$ runs about a percentage
+point high in 2024 and 2025.
+
+A natural extension would be joint estimation against the SAT User
+Percentile reference table, which would tighten the upper-tail fit at $t = 1550$
+and above.
+Beyond the SAT, the framework applies to any aggregate testing
+report that publishes per-group banded distributions; any other published
+quantities --- group or cohort means, SDs, percentiles --- can be
+held out as additional validation checks as the SAT cohort SD and
+quartiles are here. 
+
+The paper estimates per-group *latent score distributions
+conditional on test participation*, not population cognitive
+distributions. Mapping the same
+estimates to the broader college-bound or U.S. 18-year-old
+population would require a model of who choses to take the SAT. We do not attempt that mapping here.
+
+# Data and Code Availability
+
+The College Board reports used here are public [@collegeboard_annual;
+@collegeboard_percentiles]. Copies of those PDFs, the extraction scripts, the cleaned data,
+the Stan model, and the code that produced every table and figure in
+this paper are available in a public repository: \[to be supplied after blind 
+peer review is complete].
+
+# References
+
+::: {#refs}
+:::
